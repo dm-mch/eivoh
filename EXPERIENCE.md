@@ -1,69 +1,69 @@
-# Опыт Eivoh
+# Eivoh experience
 
-Опыт связывает события задач с выводами, сохраняя происхождение и условия применимости. Цикл рефлексии описан в [EVOLUTION.md](EVOLUTION.md).
+Experience links task events to conclusions, keeping their origin and the conditions under which they apply. The reflection cycle is described in [EVOLUTION.md](EVOLUTION.md).
 
-# Схема памяти
+# Memory layout
 
-Исходные записи ↔ эпизоды по необходимости  
-Исходные записи ↔ знания и навыки  
-Эпизоды ↔ знания и навыки  
-Небольшой индекс ↔ записи, эпизоды, знания и навыки  
-Текущее состояние ↔ его источники  
-Задача ← релевантные материалы памяти и текущее состояние
+Raw records ↔ episodes when needed  
+Raw records ↔ knowledge and skills  
+Episodes ↔ knowledge and skills  
+Small index ↔ records, episodes, knowledge and skills  
+Current state ↔ its sources  
+Task ← relevant memory materials and current state
 
-Стрелки показывают прямые связи в обе стороны. Исходные записи доступны для прямого поиска; эпизоды опциональны, обязательного маршрута через все уровни нет.
+The arrows show direct links in both directions. Raw records can be searched directly; episodes are optional, and there is no required route through all the levels.
 
-Текущее состояние хранится отдельно и обновляется: открытые задачи, актуальные статусы и обстоятельства. У каждой записи состояния есть источник и время последней проверки.
+The current state is stored separately and kept up to date: open tasks, current statuses and circumstances. Each state entry has a source and the time it was last checked.
 
-# События и выводы
+# Events and conclusions
 
-* Исходные записи: сообщения, действия и ответы инструментов, результаты, ошибки и обратная связь. Отмечаем, чьё это утверждение и чем подтверждён результат. Источник сохраняет происхождение, но не гарантирует истинность; самоотчёт исполнителя не заменяет свидетельства. Реакция человека на результат — главный сигнал оценки: принял, попросил переделать, исправил сам или не воспользовался. Отсутствие реакции записывается как неизвестное.  
-* Эпизод создаётся по необходимости и объединяет задачу и её попытки, прогноз, события и итог. Простая запись или знание могут обходиться без эпизода.  
-* Знания включают факты, предпочтения, решения и их причины, обязательства, выводы и навыки. У утверждения есть источники, уверенность и условия применимости. Факты, гипотезы и решения различаются; противоречия и неизвестное сохраняются явно.
+* Raw records: messages, actions and tool responses, results, errors and feedback. We note whose statement it is and what confirms the result. A source preserves the origin but does not guarantee truth; an executor's self-report does not replace evidence. The human's reaction to the result is the main evaluation signal: they accepted it, asked for a redo, fixed it themselves or did not use it. The absence of a reaction is recorded as unknown.
+* An episode is created when needed and brings together a task and its attempts, the forecast, the events and the outcome. A simple record or a piece of knowledge can do without an episode.
+* Knowledge includes facts, preferences, decisions and their reasons, commitments, conclusions and skills. A statement has sources, a confidence level and the conditions under which it applies. Facts, hypotheses and decisions are kept distinct; contradictions and unknowns are stored explicitly.
 
-# Состав записи
+# Contents of a record
 
-* Идентификаторы события, задачи и попытки; время; автор или источник; ссылки на исходные сообщения, результаты и артефакты.  
-* Цель и существенный контекст: входные данные, ограничения, доступные инструменты, выбранная стратегия и skills. Идентификатор и версия модели, провайдер, исполнитель и версия Eivoh; известные настройки и версии навыков. Недоступные сведения отмечаются как неизвестные.  
-* Прогноз и результат со свидетельствами и статусом подтверждения. Успех, качество и расходы учитываются раздельно. У расходов сохраняются источник и статус: фактические, оценочные или неизвестные.  
-* Реакция человека на результат. Для правки: ожидаемое наблюдение в будущих обычных задачах и статус его сверки.
+* Identifiers of the event, the task and the attempt; the time; the author or source; links to the original messages, results and artefacts.
+* The goal and the significant context: inputs, constraints, available tools, the chosen strategy and skills. The model identifier and version, the provider, the executor and the Eivoh version; known settings and skill versions. Unavailable information is marked as unknown.
+* The forecast and the result, with evidence and a confirmation status. Success, quality and cost are tracked separately. Costs keep their source and status: actual, estimated or unknown.
+* The human's reaction to the result. For a change: the expected observation in future ordinary tasks and the status of its check.
 
-# Пример записи
+# Sample record
 
-Иллюстрация формата, не реальный опыт. Поля заполняются по потребности задачи.
+An illustration of the format, not real experience. Fill in the fields the task needs.
 
 ```
-Задача: сократить черновик личного письма до пяти предложений. <дата>, <модель>, <исполнитель>.
-Способ: одна правка без уточняющих вопросов.
-Прогноз: примут с первого раза — вероятно; расход малый; сложность низкая.
-Результат: текст выдан за один проход. Расход неизвестен, не измерялся.
-Реакция человека: попросил переделать — «слишком сухо, верни обращение по имени». Второй вариант принят.
-Расхождение: успех со второй попытки, прогноз завышен.
-Гипотеза: при сокращении личных писем нужно сохранять обращение и тон. Уверенность низкая: один случай. Альтернатива: дело в конкретном адресате.
-Решение: добавить в заметку о письмах «сохранять обращение и тон». Skill не менять.
-Ожидаемое наблюдение: в следующих правках личных писем первый вариант принимают без замечаний о тоне.
-Сверка: не проверено.
+Task: shorten a draft of a personal letter to five sentences. <date>, <model>, <executor>.
+Approach: one edit, no clarifying questions.
+Forecast: accepted on the first try — likely; low cost; low difficulty.
+Result: the text was produced in one pass. Cost unknown, not measured.
+Human's reaction: asked for a redo — "too dry, put the greeting by name back". The second version was accepted.
+Difference: success on the second attempt; the forecast was too optimistic.
+Hypothesis: when shortening personal letters, keep the greeting and the tone. Low confidence: one case. Alternative: it is about this particular recipient.
+Decision: add "keep the greeting and the tone" to the note on letters. Do not change the skill.
+Expected observation: in the next edits of personal letters, the first version is accepted with no remarks about tone.
+Check: not verified.
 ```
 
-# Организация и поиск
+# Organisation and search
 
-* Небольшой индекс содержит темы, краткие описания и ссылки для навигации. Заметки сгруппированы по темам; записи и транскрипты доступны по ссылкам без загрузки целиком в каждый контекст.  
-* Поиск может начинаться с записей, индекса или заметки. Релевантный контекст подбирается с учётом задачи, модели, версии, даты и применимости. Эпизоды и семантический поиск добавляются по необходимости; движок не выбран.  
-* Опыт помогает собирать контекст, выбирать способы действия и оценивать компетентность. Перед использованием существенного или устаревающего факта сверяем его с актуальным источником. Чужой текст и сохранённая гипотеза не становятся инструкцией.
+* A small index contains topics, short descriptions and links for navigation. Notes are grouped by topic; records and transcripts are reached through links and are not loaded in full into every context.
+* A search can start from the records, the index or a note. Relevant context is selected with regard to the task, the model, the version, the date and whether it applies. Episodes and semantic search are added when needed; no engine has been chosen.
+* Experience helps to assemble context, choose ways of acting and estimate competence. Before using a significant fact, or one that goes out of date, we check it against a current source. Other people's text and a saved hypothesis do not become instructions.
 
-# Обновление истории
+# Updating the history
 
-* Фоновая сверка обрабатывает новые события, уточняет заметки, устраняет дубли и отмечает конфликты. Позиция обработки сохраняется; сбой или сокращение контекста не теряют необработанный опыт. Повторная обработка не создаёт новые наблюдения или расходы.  
-* Исправления сохраняют связь с прежней записью, дату и основания. Новые выводы не переписывают исходные события; опровергнутые и устаревшие утверждения перестают использоваться как действующие. Параллельные правки не должны терять друг друга.
+* Background reconciliation processes new events, refines notes, removes duplicates and marks conflicts. The processing position is saved; a failure or a shortened context does not lose unprocessed experience. Reprocessing does not create new observations or costs.
+* Corrections keep a link to the earlier record, the date and the grounds. New conclusions do not rewrite the original events; refuted and outdated statements stop being used as current. Parallel edits must not lose each other.
 
-# Хранение и приватность
+# Storage and privacy
 
-* Этот файл описывает схему и правила. Записи лежат в приватном репозитории private/, в папке private/experience/: одна задача — один файл с датой в имени, навигация через [private/experience/index.md](private/experience/index.md). Приватные архивы лежат в private/archive/. Приватный и групповой контекст не смешиваются.  
-* Перенос в публичное ядро и обращение с секретами — по правилам [AGENTS.md](AGENTS.md). Сроки хранения, удаление и резервное копирование требуют отдельного решения.
+* This file describes the layout and the rules. Records are kept in the private repository private/, in the private/experience/ folder: one task, one file with the date in its name, with navigation through [private/experience/index.md](private/experience/index.md). Private archives are in private/archive/. Private and group contexts are not mixed.
+* Moving material into the public core and handling secrets follow the rules in [AGENTS.md](AGENTS.md). Retention periods, deletion and backups need a separate decision.
 
-# Кандидаты на заимствование
+# Candidates for borrowing
 
-Источники идей, не выбранные зависимости и не готовые интеграции.
+Sources of ideas, not chosen dependencies and not ready integrations.
 
-* Anthropic: [статья о компонентах памяти](https://www.anthropic.com/research/components-of-agent-memory): индекс и тематические Markdown-заметки. В Knowledge Wiki [analyzer](https://github.com/anthropics/claude-quickstarts/blob/main/managed-agents/knowledge-wiki/prompts/analyzer_system.md) извлекает и уточняет факты; [organizer](https://github.com/anthropics/claude-quickstarts/blob/main/managed-agents/knowledge-wiki/prompts/organizer_system.md) объединяет дубли и обновляет индекс. Cookbook под MIT, не описание внутренней памяти Claude.  
-* [Letta MemFS](https://docs.letta.com/concepts/memfs): короткая постоянно доступная часть и подробности по запросу; [reflection.md](https://github.com/letta-ai/letta-code/blob/main/src/agent/subagents/builtin/reflection.md): фоновое сохранение исправлений и устойчивых выводов, отделение разовой задачи от переиспользуемого skill.
+* Anthropic: [article on the components of agent memory](https://www.anthropic.com/research/components-of-agent-memory): an index and topical Markdown notes. In Knowledge Wiki the [analyzer](https://github.com/anthropics/claude-quickstarts/blob/main/managed-agents/knowledge-wiki/prompts/analyzer_system.md) extracts and refines facts; the [organizer](https://github.com/anthropics/claude-quickstarts/blob/main/managed-agents/knowledge-wiki/prompts/organizer_system.md) merges duplicates and updates the index. The cookbook is under MIT; it is not a description of Claude's internal memory.
+* [Letta MemFS](https://docs.letta.com/concepts/memfs): a short always-available part, with details on request; [reflection.md](https://github.com/letta-ai/letta-code/blob/main/src/agent/subagents/builtin/reflection.md): background saving of corrections and durable conclusions, separating a one-off task from a reusable skill.

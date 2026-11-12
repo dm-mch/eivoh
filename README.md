@@ -1,34 +1,33 @@
 # Eivoh
 
-Evolving Identity, Values, Ontology & Humanity. Персональный ИИ-агент общего назначения, который развивается через опыт и рефлексию: уточняет знания, меняет способы работы, навыки и собственный код.
+Evolving Identity, Values, Ontology & Humanity. A general-purpose personal AI agent that develops through experience and reflection: it refines its knowledge and changes its ways of working, its skills and its own code.
 
-# Текущее состояние
+# Current state
 
-Текущий этап и то, что уже работает, описаны в [ROADMAP.md](ROADMAP.md). Остальные документы описывают целевую систему.
+The current stage and what already works are described in [ROADMAP.md](ROADMAP.md). The other documents describe the target system.
 
-Bootstrap: текущая версия инструкций и накопленный опыт используются для создания следующих версий Eivoh.
+Bootstrap: the current version of the instructions and the accumulated experience are used to create the next versions of Eivoh.
 
-# Документы
+# Documents
 
-* [VISION.md](VISION.md) — назначение, долгосрочное направление и ориентиры.  
-* [ARCHITECTURE.md](ARCHITECTURE.md) — целевые компоненты, связи и открытые технические решения.  
-* [AGENTS.md](AGENTS.md) — инструкции агенту для работы с проектом сейчас.  
-* [EVOLUTION.md](EVOLUTION.md) — рефлексия и изменение памяти, стратегий, навыков и кода.  
-* [EXPERIENCE.md](EXPERIENCE.md) — исходные записи, знания, текущее состояние и поиск.  
-* [ROADMAP.md](ROADMAP.md) — этапы развития, текущий этап и ожидаемый результат каждого этапа.  
-* private/ — отдельный приватный репозиторий, в ядре игнорируется. Создаётся локально для каждого экземпляра Eivoh: private/experience/ с записями опыта и индексом, private/archive/ с архивами, которые не являются инструкциями или согласованными решениями.
+* [VISION.md](VISION.md): purpose, long-term direction and guiding principles.
+* [ARCHITECTURE.md](ARCHITECTURE.md): target components, their connections and open technical decisions.
+* [AGENTS.md](AGENTS.md): instructions for the agent working on the project now.
+* [EVOLUTION.md](EVOLUTION.md): reflection and changes to memory, strategies, skills and code.
+* [EXPERIENCE.md](EXPERIENCE.md): raw records, knowledge, current state and search.
+* [ROADMAP.md](ROADMAP.md): development stages, the current stage and the expected result of each stage.
+* private/: a separate private repository that the core ignores. Each Eivoh instance creates it locally: private/experience/ holds experience records and their index, private/archive/ holds archives, which are neither instructions nor agreed decisions.
 
-# Как начать
+# Getting started
 
-1. Подготовить рабочую копию Markdown-файлов и открыть её в Codex или Claude. Google Docs служат местом совместного редактирования, не исполняемой средой агента.  
-2. Следовать AGENTS.md: прочитать указанные там документы, проверить фактическое состояние проекта и поставить конкретную задачу.  
-3. Выполнить минимальное полезное изменение, сохранить результат, основания и ограничения. Запись опыта положить в private/experience/.
+1. Prepare a working copy of the Markdown files and open it in Codex or Claude. Google Docs are a place for collaborative editing, not the agent's runtime.
+2. Follow AGENTS.md: read the documents it names, check the actual state of the project and set a specific task.
+3. Make the smallest useful change and save the result, the reasons and the limitations. Put the experience record in private/experience/.
 
-# Направление разработки
+# Development direction
 
-Целевая система постоянно работает на VM, поддерживает сменные каналы общения и нативные CLI-исполнители, сохраняет собственные задачи и память. Telegram вероятно станет основным каналом, но не определяет устройство системы. Python и SQLite рассматриваются, но стек ещё не утверждён.
+The target system runs continuously on a VM, supports interchangeable communication channels and native CLI executors, and keeps its own tasks and memory. Telegram will probably become the main channel, but it does not define how the system is built. Python and SQLite are being considered; the stack is not yet approved.
 
-# Приватное и публичное
+# Private and public
 
-Публичное ядро содержит общие документы и код. Папка private/ — приватная часть в отдельном репозитории: опыт, переписка, архивы, состояние. Правки ядра агент ведёт в рабочей ветке work, в main они попадают через PR. Правила изменений и публикации описаны в [AGENTS.md](AGENTS.md).
-
+The public core contains the shared documents and code. The private/ folder is the private part, kept in a separate repository: experience, correspondence, archives and state. The agent makes core changes on the working branch `work`; they reach `main` through a PR. The rules for changes and publication are in [AGENTS.md](AGENTS.md).

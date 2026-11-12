@@ -1,46 +1,45 @@
-# План развития Eivoh
+# Eivoh development plan
 
-Текущий этап: V0. Дальнейшая последовательность предложена для согласования; сроки не заданы. Архитектура описывает целевую систему, этот файл — порядок её появления и единственное место, где указан текущий этап.
+Current stage: V0. The sequence that follows is proposed for agreement; no dates are set. The architecture describes the target system; this file describes the order in which it appears and is the only place where the current stage is stated.
 
-# V0. Markdown и bootstrap
+# V0. Markdown and bootstrap
 
-Состояние: Markdown-основа, а не готовый сервис. Задачи выполняет запущенный Codex или Claude, используя документы проекта. Gateway, постоянная работа на VM, каналы, хранилище и автоматическая рефлексия относятся к следующим этапам; их наличие не предполагается.
+State: a Markdown foundation, not a finished service. Tasks are carried out by a running Codex or Claude using the project documents. The gateway, continuous operation on a VM, channels, storage and automatic reflection belong to later stages; they are not assumed to exist.
 
-* Согласовать README, VISION, ARCHITECTURE, AGENTS, EVOLUTION, EXPERIENCE и ROADMAP; сохранить их как Markdown в рабочем репозитории.  
-* Отделить публичные документы от приватной переписки и опыта. Архив обсуждений оставить приватным источником, а не автоматически действующими инструкциями.  
-* Применить AGENTS.md к реальной задаче развития проекта через Codex или Claude; записать результат и рефлексию в private/experience/.
+* Agree on README, VISION, ARCHITECTURE, AGENTS, EVOLUTION, EXPERIENCE and ROADMAP; keep them as Markdown in the working repository.
+* Separate the public documents from private correspondence and experience. Keep the discussion archive as a private source, not as instructions that apply automatically.
+* Apply AGENTS.md to a real task of developing the project through Codex or Claude; record the result and the reflection in private/experience/.
 
-Результат: согласованные инструкции позволяют агенту продолжать разработку без требования ещё не существующих сервисов. Следующие изменения опираются на эти файлы и опыт их применения.
+Result: agreed instructions let the agent continue development without requiring services that do not exist yet. Further changes rest on these files and on the experience of applying them.
 
-# Следующий шаг. Минимальный рабочий контур
+# Next step. A minimal working loop
 
-* Выбрать язык и минимальное хранилище под первую задачу; Python и SQLite остаются кандидатами.  
-* Подключить одного нативного CLI-исполнителя: запуск, продолжение сессии, вывод и отмена. Интерфейс адаптера сразу рассчитывать на Codex и Claude. Отдельно выяснить поддержку session resume и prompt cache.  
-* Сохранять задачу, существенный контекст, события и результат независимо от CLI-сессии. Предусмотреть прерывание и восстановление.  
-* Применять краткую рефлексию к обычным задачам и сохранять основания изменений. Не требовать отдельной дорогой оценки каждого действия.
+* Choose a language and minimal storage for the first task; Python and SQLite remain candidates.
+* Connect one native CLI executor: start, session continuation, output and cancellation. Design the adapter interface for both Codex and Claude from the start. Find out separately what support there is for session resume and prompt cache.
+* Save the task, the significant context, the events and the result independently of the CLI session. Provide for interruption and recovery.
+* Apply brief reflection to ordinary tasks and save the grounds for changes. Do not require a separate, expensive evaluation of every action.
 
-Результат: Eivoh проводит реальную задачу от запроса до результата, сохраняет её состояние и может продолжить работу после прерывания. Показано, что уже работает и что остаётся непроверенным.
+Result: Eivoh takes a real task from request to result, saves its state and can continue after an interruption. It is shown what already works and what remains unverified.
 
-# Постоянная работа и каналы
+# Continuous operation and channels
 
-* Поднять постоянно работающий gateway на VM с управлением запуском, остановкой и восстановлением.  
-* Подключить Telegram и CLI через общий интерфейс каналов. Для Telegram завести отдельного бота Eivoh. Разделять пользователя, разговор, задачу и сессию исполнителя; не смешивать приватный и групповой контекст.  
-* Добавить фоновые задачи и учёт доступных ресурсов. Приоритеты и объём активности менять по запросам пользователя, оставшимся лимитам и неполноте учёта.
+* Bring up a continuously running gateway on the VM, with control over start, stop and recovery.
+* Connect Telegram and the CLI through a common channel interface. Create a separate Eivoh bot for Telegram. Distinguish the user, the conversation, the task and the executor session; do not mix private and group contexts.
+* Add background tasks and tracking of available resources. Change priorities and the amount of activity according to user requests, remaining limits and the incompleteness of the accounting.
 
-Результат: задачи доступны через подключённые каналы и не теряются при перезапуске. Бесшовный переход между каналами развивается отдельно, без блокирования первого полезного запуска.
+Result: tasks are available through the connected channels and are not lost on restart. Seamless movement between channels is developed separately, without blocking the first useful launch.
 
-# Память и самостоятельное развитие
+# Memory and independent development
 
-* Наращивать память по EXPERIENCE.md: исходные записи, небольшой индекс, тематические знания, отдельное текущее состояние; эпизоды создавать по необходимости.  
-* Добавить инкрементальную фоновую сверку, исправление заметок и подбор релевантного контекста. Сохранять источники, противоречия и условия применимости.  
-* Развивать прогнозирование, выбор стратегий и рефлексию по EVOLUTION.md на опыте обычных задач. Менять не только память, но и skills, код и модули.  
-* Автоматизировать соблюдение правил репозиториев, проверку приватности, остановку и восстановление. Агент не расширяет собственные права.
+* Grow the memory according to EXPERIENCE.md: raw records, a small index, topical knowledge, a separate current state; create episodes when needed.
+* Add incremental background reconciliation, correction of notes and selection of relevant context. Keep the sources, the contradictions and the conditions under which things apply.
+* Develop forecasting, strategy choice and reflection according to EVOLUTION.md, on the experience of ordinary tasks. Change not only memory but also skills, code and modules.
+* Automate compliance with the repository rules, the privacy check, stopping and recovery. The agent does not extend its own rights.
 
-Результат: опыт доступен следующим задачам, изменения имеют основания и историю, а предыдущую версию можно восстановить. Порядок рефлексии и сверки — по EVOLUTION.md.
+Result: experience is available to later tasks, changes have grounds and a history, and the previous version can be restored. The procedure for reflection and checking follows EVOLUTION.md.
 
-# Решать по мере необходимости
+# Decide as needed
 
-Число процессов, конкретный scheduler, источники лимитов, семантический поиск, граф памяти, алгоритмы компетентности и автоматический выбор моделей. Новые зависимости и кандидаты из ARCHITECTURE.md подключаются под конкретную потребность, с учётом лицензий и совместимости.
+The number of processes, the specific scheduler, the sources for limits, semantic search, a memory graph, competence algorithms and automatic model selection. New dependencies and the candidates from ARCHITECTURE.md are connected for a specific need, with licences and compatibility taken into account.
 
-После каждого этапа уточнять следующий шаг по реальному опыту. Не разрабатывать все логические компоненты заранее как отдельные сервисы.
-
+After each stage, refine the next step from real experience. Do not build all the logical components in advance as separate services.
