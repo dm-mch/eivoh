@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from eivoh.channels.telegram import TelegramChannel
 
@@ -13,6 +13,7 @@ def make_bot():
                            set_my_commands=AsyncMock(return_value=True),
                            edit_message_text=AsyncMock(return_value=True),
                            delete_message=AsyncMock(return_value=True),
+                           set_message_reaction=AsyncMock(return_value=True),
                            send_chat_action=AsyncMock(return_value=True))
 
 
@@ -48,6 +49,8 @@ async def test_flood_backoff_serializes_chat(monkeypatch):
     await entered.wait()
     send = asyncio.create_task(channel.send('10', 'waits behind the back-off'))
     await channel.typing('10')  # The sign of life is not queued behind deliveries.
+    await channel.react('10', '7', '👀')
+    bot.set_message_reaction.assert_awaited_once_with(chat_id='10', message_id=7, reaction='👀')
     assert bot.send_chat_action.call_count == 1 and bot.send_message.call_count == 0
     release.set()
     await asyncio.gather(edit, send)
@@ -55,6 +58,23 @@ async def test_flood_backoff_serializes_chat(monkeypatch):
     bot.send_chat_action.side_effect = RetryAfter(5)
     await channel.typing('10')  # Best-effort: a refused indicator is dropped.
     assert sleeps[0] > 0
+
+
+@pytest.mark.parametrize('error', [None, TelegramError('offline'), RetryAfter(5)])
+async def test_react_is_best_effort_without_lock_backoff_or_retry(error, caplog):
+    bot = make_bot()
+    bot.set_message_reaction.side_effect = error
+    channel = TelegramChannel('unused', 1, bot)
+    channel.blocked_until['10'] = asyncio.get_running_loop().time() + 3600
+    lock = channel.locks.setdefault('10', asyncio.Lock())
+    caplog.set_level('DEBUG', logger='eivoh.channels.telegram')
+    async with lock:
+        await asyncio.wait_for(channel.react('10', '7', '✍'), 1)
+    bot.set_message_reaction.assert_awaited_once_with(chat_id='10', message_id=7, reaction='✍')
+    assert not bot.send_message.called
+    if error:
+        assert 'Reaction not sent' in caplog.text
+        assert all(record.levelname == 'DEBUG' for record in caplog.records)
 
 
 async def test_typing_survives_task_switch_during_edit_flood(tmp_path, monkeypatch, caplog):

@@ -3,10 +3,13 @@ from contextlib import aclosing
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from conftest import FakeChannel, inbound, until
+from eivoh.channels.base import Inbound
 from eivoh.executors.base import Event, Record, SteerResult
 from eivoh.executors.claude import ClaudeStreamExecutor
 from eivoh.executors.codex_app import CodexAppExecutor
@@ -54,13 +57,14 @@ async def test_busy_multiple_inputs_are_one_result_and_native_resume(live_rig):
     assert count == 1 and transcript.count('Assistant:') == 1
     assert 'User (during the same turn):\nFIRST' in transcript
     assert storage.session(1, storage.default_executor)['synced_inbound_id'] == 3
-    assert sum('Added to the running task' in text for _, text in channel.sent) == 2
+    assert channel.reactions == [('10', '2', '👀'), ('10', '3', '👀')]
+    assert not any('Added to the running' in text or 'Queued for task' in text for _, text in channel.sent)
     await gateway.receive(inbound(4, 'resume'))
     await gateway.idle()
     assert storage.turn_for(4)['session_id'] == storage.turn_for(1)['session_id']
 
 
-async def test_queue_is_fifo_barrier_and_model_change_queues(live_rig):
+async def test_queue_is_fifo_barrier(live_rig):
     gateway, storage, adapter, channel, path = live_rig
     await gateway.receive(inbound(1, 'held'))
     await ready(live_rig)
@@ -72,6 +76,8 @@ async def test_queue_is_fifo_barrier_and_model_change_queues(live_rig):
     assert 'ANSWER QUEUED' in storage.stored_result(2)[0]
     assert '/q' not in storage.stored_result(2)[0]
     assert 'AFTER' in storage.stored_result(storage.turn_for(3)['id'])[0]
+    assert channel.reactions == [('10', '2', '✍'), ('10', '3', '✍')]
+    assert not any('Queued for task' in text for _, text in channel.sent)
 
 
 async def test_stop_while_steering_cleans_processes(live_rig):
@@ -86,6 +92,7 @@ async def test_stop_while_steering_cleans_processes(live_rig):
     assert storage.turn_for(1)['status'] == 'cancelled'
     assert storage.turn_for(2)['status'] == 'cancelled'
     assert not adapter.running and pid not in process_table()
+    assert not channel.reactions
 
 
 async def test_claude_crosses_result_boundary(live_rig):
@@ -117,6 +124,7 @@ async def test_unknown_ack_timeout_queues_cautious_prompt(live_rig):
     assert storage.turn_for(2)['status'] == 'completed'
     assert any('could not be confirmed' in text for _, text in channel.sent)
     assert 'do not repeat completed actions' in storage.stored_result(2)[0]
+    assert not channel.reactions
 
 
 def setup_pending(storage):
@@ -179,31 +187,241 @@ async def test_model_change_during_run_does_not_steer_old_model(live_rig):
     assert storage.turn_for(3)['model'] == model
     assert 'NEW MODEL' not in storage.stored_result(1)[0]
     assert 'NEW MODEL' in storage.stored_result(storage.turn_for(3)['id'])[0]
+    assert any('using the selected model' in text for _, text in channel.sent)
+    assert not channel.reactions
 
 
-async def test_notice_flood_wait_does_not_hold_executor_slot(live_rig):
+async def test_slow_reaction_does_not_hold_lock_slot_or_steering(live_rig):
     gateway, storage, adapter, channel, path = live_rig
     blocked, release = asyncio.Event(), asyncio.Event()
-    send = channel.send
-    async def slow_notice(chat, text, *args):
-        if 'Added to the running' in text:
-            blocked.set()
-            await release.wait()
-        return await send(chat, text, *args)
-    channel.send = slow_notice
+    async def slow_react(*args):
+        blocked.set()
+        await release.wait()
+    async def prepare(row):
+        return 'PREPARED', []
+    channel.react = slow_react
+    channel.prepare = prepare
     gateway.slots = asyncio.Semaphore(1)
     await gateway.receive(inbound(1, 'held'))
     await ready(live_rig)
-    await gateway.receive(inbound(2, 'CLARIFY'))
-    await until(lambda: (path / 'wire-input.jsonl').exists() and 'CLARIFY' in (path / 'wire-input.jsonl').read_text())
-    (path / 'release').touch()
+    await gateway.receive(Inbound('fake', '10', '1', '2', '', attachments=({'kind': 'document'},)))
     await asyncio.wait_for(blocked.wait(), 5)
+    await asyncio.wait_for(gateway.receive(inbound(3, 'MORE')), 1)
+    await until(lambda: (path / 'wire-input.jsonl').exists() and 'MORE' in (path / 'wire-input.jsonl').read_text())
+    (path / 'release').touch()
     await until(lambda: storage.turn_for(1)['status'] == 'completed')
     assert gateway.slots._value == 1
-    await gateway.receive(inbound(3, 'FOLLOWUP'))
+    await asyncio.wait_for(gateway.receive(inbound(4, 'FOLLOWUP')), 1)
     await asyncio.wait_for(gateway.idle(), 5)
-    assert storage.turn_for(3)['status'] == 'completed'
+    assert storage.turn_for(4)['status'] == 'completed'
+    assert storage.steering(2)['state'] == storage.steering(3)['state'] == 'accepted'
     release.set()
+
+
+@pytest.mark.parametrize('text', ['CLARIFY', '/q QUEUED'])
+async def test_channel_without_react_stays_silent(live_rig, text):
+    gateway, storage, adapter, channel, path = live_rig
+    gateway.channels['fake'] = SimpleNamespace(send=channel.send, edit=channel.edit, typing=channel.typing)
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(inbound(2, text))
+    if not text.startswith('/q'):
+        await until(lambda: (path / 'wire-input.jsonl').exists() and text in (path / 'wire-input.jsonl').read_text())
+    (path / 'release').touch()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert storage.turn_for(2)['status'] == 'completed'
+    assert not channel.reactions
+    assert not any('Added to the running' in text or 'Queued for task' in text for _, text in channel.sent)
+
+
+@pytest.mark.parametrize('text', ['CLARIFY', '/q QUEUED'])
+async def test_failing_react_does_not_fail_turn(live_rig, text, caplog):
+    gateway, storage, adapter, channel, path = live_rig
+    caplog.set_level('DEBUG', logger='eivoh.gateway')
+    channel.react = AsyncMock(side_effect=RuntimeError('synthetic reaction failure'))
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(inbound(2, text))
+    if not text.startswith('/q'):
+        await until(lambda: (path / 'wire-input.jsonl').exists() and text in (path / 'wire-input.jsonl').read_text())
+    (path / 'release').touch()
+    await asyncio.wait_for(gateway.idle(), 5)
+    await until(lambda: channel.react.await_count == 1)
+    assert storage.turn_for(2)['status'] == 'completed'
+    assert not gateway.notice_jobs
+    assert 'Reaction not sent: RuntimeError' in caplog.text
+    assert not any('Added to the running' in text or 'Queued for task' in text for _, text in channel.sent)
+
+
+async def test_button_queue_has_no_reaction(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(inbound('cb:press', '/q BUTTON'))
+    (path / 'release').touch()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert storage.turn_for(2)['status'] == 'completed'
+    assert not channel.reactions
+    assert not any('Queued for task' in text for _, text in channel.sent)
+
+
+async def test_stop_before_queued_reaction_starts(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(inbound(2, '/q QUEUED'))
+    await gateway.receive(inbound(3, '/stop'))
+    await gateway.idle()
+    assert storage.inbound(2)['state'] == 'cancelled'
+    assert not channel.reactions and not gateway.notice_jobs
+
+
+@pytest.mark.parametrize('shutdown', [False, True])
+async def test_slow_reaction_is_cancelled_on_stop_or_shutdown(live_rig, shutdown):
+    gateway, storage, adapter, channel, path = live_rig
+    blocked, cancelled = asyncio.Event(), asyncio.Event()
+    async def react(*args):
+        blocked.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    channel.react = react
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(inbound(2, '/q QUEUED'))
+    await asyncio.wait_for(blocked.wait(), 5)
+    if shutdown:
+        await asyncio.wait_for(gateway.shutdown(), 5)
+    else:
+        await asyncio.wait_for(gateway.receive(inbound(3, '/stop')), 5)
+    assert cancelled.is_set() and not gateway.notice_jobs and not gateway.reaction_jobs
+
+
+async def test_busy_attachment_preparation_and_fifo_react_silently(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    prepared = asyncio.Event()
+    async def prepare(row):
+        await prepared.wait()
+        return 'PREPARED', json.loads(row['attachments'])
+    channel.prepare = prepare
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(Inbound('fake', '10', '1', '2', '', attachments=({'kind': 'document'},)))
+    await gateway.receive(inbound(3, 'AFTER'))
+    await until(lambda: len(channel.reactions) == 2)
+    assert storage.inbound(2)['preparation'] == 'pending'
+    assert channel.reactions == [('10', '2', '✍'), ('10', '3', '✍')]
+    prepared.set()
+    await until(lambda: (path / 'wire-input.jsonl').exists() and 'AFTER' in (path / 'wire-input.jsonl').read_text())
+    (path / 'release').touch()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert ('10', '2', '👀') in channel.reactions and ('10', '3', '👀') in channel.reactions
+    assert not any('Preparing attachment' in text or 'Queued for task' in text or 'Added to the running' in text
+                   for _, text in channel.sent)
+
+
+async def test_attachment_reactions_stay_ordered_without_blocking_turn(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    prepared, blocked, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    react = channel.react
+    async def slow_react(chat, mid, emoji):
+        if emoji == '✍':
+            blocked.set()
+            await release.wait()
+        await react(chat, mid, emoji)
+    async def prepare(row):
+        await prepared.wait()
+        return 'PREPARED', []
+    channel.react, channel.prepare = slow_react, prepare
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(Inbound('fake', '10', '1', '2', '', attachments=({'kind': 'document'},)))
+    await asyncio.wait_for(blocked.wait(), 5)
+    prepared.set()
+    await until(lambda: (path / 'wire-input.jsonl').exists() and 'PREPARED' in (path / 'wire-input.jsonl').read_text())
+    (path / 'release').touch()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert storage.steering(2)['state'] == 'accepted' and not channel.reactions
+    release.set()
+    await until(lambda: len(channel.reactions) == 2)
+    assert channel.reactions == [('10', '2', '✍'), ('10', '2', '👀')]
+    await until(lambda: not gateway.reaction_jobs)
+
+
+async def test_followup_during_final_delivery_reacts_as_queued(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    blocked, release = asyncio.Event(), asyncio.Event()
+    send = channel.send
+    async def slow_send(*args):
+        blocked.set()
+        await release.wait()
+        return await send(*args)
+    channel.send = slow_send
+    await gateway.receive(inbound(1, 'original'))
+    await asyncio.wait_for(blocked.wait(), 5)
+    await until(lambda: not gateway.active_runs and storage.turn_for(1)['status'] == 'completed')
+    await asyncio.wait_for(gateway.receive(inbound(2, 'FOLLOWUP')), 1)
+    await until(lambda: channel.reactions)
+    assert storage.turn_for(2)['status'] == 'queued'
+    assert channel.reactions == [('10', '2', '✍')]
+    release.set()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert storage.turn_for(2)['status'] == 'completed'
+    assert not any('Queued for task' in text for _, text in channel.sent)
+
+
+@pytest.mark.parametrize('preparing', [False, True])
+async def test_fifo_before_executor_launch_reacts_as_queued(live_rig, preparing):
+    gateway, storage, adapter, channel, path = live_rig
+    prepared = asyncio.Event()
+    async def prepare(row):
+        await prepared.wait()
+        return 'PREPARED', []
+    channel.prepare = prepare
+    gateway.slots = asyncio.Semaphore(1)
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    await gateway.receive(inbound(2, '/new'))
+    if preparing:
+        await gateway.receive(Inbound('fake', '10', '1', '3', '', attachments=({'kind': 'document'},)))
+        await until(lambda: 2 not in gateway.workers)
+    else:
+        await gateway.receive(inbound(3, 'WAITING FOR SLOT'))
+    await gateway.receive(inbound(4, 'AFTER'))
+    await until(lambda: channel.reactions)
+    assert channel.reactions == [('10', '4', '✍')]
+    prepared.set()
+    (path / 'release').touch()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert storage.turn_for(3)['status'] == storage.turn_for(4)['status'] == 'completed'
+    assert not any('Queued for task' in text for _, text in channel.sent)
+
+
+async def test_executor_change_keeps_selected_model_notice(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    other = 'codex' if storage.default_executor == 'claude' else 'claude'
+    gateway.executors[other] = adapter
+    await gateway.receive(inbound(1, 'held'))
+    await ready(live_rig)
+    row = storage.journal(inbound(2, '/model ' + other))
+    storage.set_model(row['id'], other, None)
+    await gateway.receive(inbound(3, 'NEW EXECUTOR'))
+    assert storage.steering(3) is None
+    (path / 'release').touch()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert storage.turn_for(3)['executor'] == other
+    assert any('using the selected model' in text for _, text in channel.sent)
+    assert not channel.reactions
+
+
+async def test_restart_unknown_delivery_keeps_notice_without_reaction(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    setup_pending(storage)
+    await gateway.start()
+    await asyncio.wait_for(gateway.idle(), 5)
+    assert any('Earlier delivery to task 1 could not be confirmed' in text for _, text in channel.sent)
+    assert not channel.reactions
 
 
 async def test_multiple_tasks_route_reply_while_steering(live_rig):
@@ -220,7 +438,8 @@ async def test_multiple_tasks_route_reply_while_steering(live_rig):
     assert storage.turn_for(3)['task_id'] == 2
     assert 'FIRST TASK' in storage.stored_result(1)[0]
     assert 'FIRST TASK' not in storage.stored_result(storage.turn_for(3)['id'])[0]
-    assert any('#t1' in text and 'Added to the running' in text for _, text in channel.sent)
+    assert channel.reactions == [('10', '4', '👀')]
+    assert not any('Added to the running' in text for _, text in channel.sent)
 
 
 async def test_replayed_parent_result_finalizes_accepted_children_without_launch(live_rig):
@@ -234,6 +453,7 @@ async def test_replayed_parent_result_finalizes_accepted_children_without_launch
     assert storage.turn_for(2)['status'] == 'completed'
     assert storage.session(1, storage.default_executor)['synced_inbound_id'] == 2
     assert any('saved final' in text for _, text in channel.sent)
+    assert not channel.reactions
 
 
 async def test_shutdown_sending_recovers_as_unknown(live_rig):
@@ -474,7 +694,8 @@ async def test_codex_matching_rpc_before_terminal_is_acceptance_without_echo(liv
     assert storage.steering(2)['state'] == 'accepted'
     assert storage.stored_result(1)[0] == 'ANSWER rpc-only ACCEPTED'
     assert storage.stored_result(2) is None
-    assert any('Added to the running' in text for _, text in channel.sent)
+    assert channel.reactions == [('10', '2', '👀')]
+    assert not any('Added to the running' in text for _, text in channel.sent)
 
 
 async def test_unanswered_interrupt_rpc_is_transport_error_not_task_cancellation(live_rig):
@@ -529,6 +750,9 @@ async def test_exception_parent_wakes_delayed_fallback_without_new_message(tmp_p
         await until(lambda: storage.turn_for(2)['status'] == 'completed')
         assert executor.prompts == ['original', 'fallback']
         assert storage.steering(2)['state'] == 'queued'
+        await until(lambda: channel.reactions)
+        assert channel.reactions == [('10', '2', '✍')]
+        assert not any('running turn is ending' in text for _, text in channel.sent)
     finally:
         await gateway.shutdown()
         storage.close()
@@ -616,3 +840,11 @@ def test_complete_part_replay_does_not_duplicate_current_aggregate(tmp_path):
     )))
     assert storage.stored_result(turn['id']) == ('OLD\n\nNEW\n\nFINAL', None)
     storage.close()
+
+
+async def test_explicit_queue_on_idle_task_starts_without_reaction(live_rig):
+    gateway, storage, adapter, channel, path = live_rig
+    await gateway.receive(inbound(1, '/q first'))
+    await gateway.idle()
+    assert storage.turn_for(1)['status'] == 'completed'
+    assert not channel.reactions and len(channel.sent) == 1

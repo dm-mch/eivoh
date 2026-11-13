@@ -317,3 +317,9 @@ class TelegramChannel:
             await self.bot.send_chat_action(chat_id=chat_id, action="typing")
         except TelegramError as exc:
             log.debug("Typing indicator not sent: %s", type(exc).__name__)
+
+    async def react(self, chat_id, message_id, emoji):
+        try:
+            await self.bot.set_message_reaction(chat_id=chat_id, message_id=int(message_id), reaction=emoji)
+        except TelegramError as exc:
+            log.debug("Reaction not sent: %s", type(exc).__name__)
