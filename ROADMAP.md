@@ -7,7 +7,7 @@ Current stage: V0. No dates are set. The architecture describes the target syste
 * Bootstrap. Each stage is built with what the previous stage provides. The work on the next stage is the stream of real tasks for the current one: there are no separate practice tasks.
 * Chat first. The owner works with Eivoh through chat. A command line is acceptable as a starting point and for debugging, not as the main interface.
 * Reuse. Before a stage starts, look at the open-source candidates named in it, check the licence and current state, and record the decision: depend, copy and adapt, or use as a reference. The studied projects are tied to their own agent loops, so none of them is taken as a whole. Copied code keeps its attribution.
-* The stack named below (Python, SQLite, python-telegram-bot) is proposed. It is confirmed when the stage that needs it starts.
+* The V1 stack is confirmed: Python 3.12, stdlib SQLite, asyncio and python-telegram-bot 22.x as an unmodified dependency. Later additions are decided when needed.
 * A stage is done when its "Done when" conditions are observed in real use, not when the code is written. After each stage, review the experience records and refine the next stage.
 
 The reuse notes come from reading the code of the candidates. Nothing was run, so formats and behaviour must be confirmed by a test before they are relied on.
@@ -23,6 +23,8 @@ Done when: V1 is built by following these documents; the experience records of t
 
 # V1. Chat with one executor
 
+State: code built and tested with a fake executor on Python 3.12.3; an opt-in live test with the real Claude CLI passed (turn, resume, cancel during a tool call without orphans). Storage separates tasks from turns and starts at schema migration 1. Recovery, shutdown ordering and per-turn subreaper cleanup have offline regression coverage. The installed Claude CLI probe confirmed the JSONL/session-id format, resume after a hard kill, prompt delivery with stdin closed, subscription login with API-key variables removed, and a Bash tool call in headless `bypassPermissions` mode. Native SIGTERM/SIGINT descendant cleanup, interactive approval/error shapes and persistence of the last message if killed during a write remain unverified. Plugins enabled globally in Claude Code are loaded by the executor unless disabled with an `EIVOH_CLAUDE_ARGS` settings override. Observed once on the installed service (2026-11-13): messages from Telegram are answered, consecutive messages continue one executor session, a service restart in the middle of a turn resumed the turn and it completed, and deployment through the release worktree script worked. `/stop` during a tool call cancelled the turn and left no process in the service's control group. The work on V2 through the chat is not yet observed.
+
 Goal: the owner sends a message in Telegram and a real coding CLI does the task; from this point the work on Eivoh itself goes through this chat.
 
 Build:
@@ -30,14 +32,14 @@ Build:
 * Executor adapter with one interface for all executors: start, resume, stream of events, cancel. Events: session started, text delta, message, tool started, tool finished, approval requested, usage, turn completed, error. Claude Code CLI is connected first; the interface is designed for Codex as well.
 * Telegram channel behind a generic channel interface: a separate Eivoh bot, long polling, access for the owner only by numeric user id.
 * Chat basics: the answer appears progressively by editing a message, long answers are split, Markdown is converted for Telegram with a plain-text fallback, a typing indicator, `/stop` cancels the running task, `/new` starts a new one.
-* State in Eivoh's own storage: conversation, task, executor session id, every raw executor event, and a journal of inbound messages written before processing starts.
-* A service on the VM with start, stop and restart.
+* State in Eivoh's own storage: conversation with active task, task with executor and session id, per-message turns with raw executor events, and a journal of inbound messages written before processing starts.
+* A service on the VM with start, stop and restart, running from a separate release checkout while the executor edits the working tree.
 
 Reuse:
 
 * Claude side: our own small adapter on the standard library (subprocess and JSON lines). Reference for the wire format, session id, resume and shutdown order: claude-agent-sdk-python (MIT). It is not a dependency for now: it brings its own bundled CLI and extra packages.
 * Telegram library: python-telegram-bot (LGPL-3.0, used as an unmodified dependency). Both studied Python projects use it.
-* Copy and adapt from nanobot (MIT), `nanobot/channels/telegram/runtime.py`: message splitting that keeps code blocks intact, Markdown to Telegram HTML, the plain-text fallback, the typing loop, and the pattern where `/stop` bypasses the per-conversation queue.
+* Own implementations using nanobot (MIT), `nanobot/channels/telegram/runtime.py`, as a studied reference: message splitting that keeps code blocks intact, Markdown to Telegram HTML, the plain-text fallback, the typing loop, and the pattern where `/stop` bypasses the per-conversation queue.
 * Reference: hermes-agent (MIT) for edge cases: flood control and back-off on edits, send errors that must not be retried, the systemd unit; openclaw `extensions/anthropic/cli-backend.ts` (MIT) for the Claude arguments and the list of environment variables to clear.
 
 Confirm by test before relying on it:

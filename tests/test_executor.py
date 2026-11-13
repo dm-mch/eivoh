@@ -1,0 +1,168 @@
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+
+from eivoh.executors.claude import ClaudeExecutor, parse_line, process_table
+from eivoh.config import Config
+
+
+def test_real_sanitized_stream():
+    lines = (Path(__file__).parent / 'fixtures/claude_stream.jsonl').read_text().splitlines(keepends=True)
+    records = [parse_line(line) for line in lines]
+    assert [r.raw_line for r in records] == lines
+    events = [e for r in records for e in r.events]
+    assert {'session_started', 'text_delta', 'message', 'tool_started', 'tool_finished', 'usage', 'turn_completed'} <= {e.kind for e in events}
+    assert events[0].session_id == 'session-placeholder'
+    assert all(e.raw is r.payload for r in records for e in r.events)
+    assert any(r.payload.get('type') == 'rate_limit_event' and not r.events for r in records)
+    assert events[-1].data['status'] == 'completed'
+
+
+def test_parser_failures_and_denials():
+    assert parse_line('bad\n').events[0].kind == 'error'
+    assert not parse_line('[]\n').events
+    record = parse_line(json.dumps({'type': 'result', 'is_error': True, 'permission_denials': [{'tool_name': 'Bash'}], 'result': 'refused'}))
+    assert [e.kind for e in record.events] == ['usage', 'approval_requested', 'error', 'turn_completed']
+    assert record.events[-1].data['status'] == 'failed'
+
+
+async def test_environment_stdin_and_resume(rig, monkeypatch):
+    _, _, executor, _, path = rig
+    for key in ('CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_TEST', 'ANTHROPIC_API_KEY', 'ANTHROPIC_TEST'):
+        monkeypatch.setenv(key, 'test-only')
+    records = [r async for r in executor.start(100, 'first\nline')]
+    sid = next(e.session_id for r in records for e in r.events if e.kind == 'session_started')
+    await asyncio.sleep(0)
+    _ = [r async for r in executor.resume(101, sid, 'second')]
+    logs = [json.loads(line) for line in (path / 'prompts.jsonl').read_text().splitlines()]
+    assert logs[0]['prompt'] == 'first\nline'
+    assert logs[1]['resume'] == sid
+    assert all(not row['env_keys'] for row in logs)
+    assert '--include-partial-messages' in logs[0]['args']
+    assert '--bare' not in logs[0]['args']
+    with pytest.raises(ValueError):
+        executor.resume(102, '--bad', 'x')
+
+
+async def test_config_args_reach_fake_executor_on_start_and_resume(rig, monkeypatch):
+    _, _, executor, _, path = rig
+    settings = '{"enabledPlugins":{"example-plugin@example-marketplace":false}}'
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    monkeypatch.setenv('EIVOH_WORKDIR', str(path))
+    monkeypatch.setenv('EIVOH_CLAUDE_ARGS', f"--settings '{settings}'")
+    config = Config.from_env()
+    adapter = ClaudeExecutor(config.workdir, executor.binary, model='test-model',
+                             extra_args=config.claude_args, grace=0.1)
+    records = [r async for r in adapter.start(100, 'first')]
+    sid = next(e.session_id for r in records for e in r.events if e.kind == 'session_started')
+    _ = [r async for r in adapter.resume(101, sid, 'second')]
+    logs = [json.loads(line) for line in (path / 'prompts.jsonl').read_text().splitlines()]
+    built_in = ['-p', '--output-format', 'stream-json', '--verbose',
+                '--include-partial-messages', '--permission-mode', 'bypassPermissions']
+    assert logs[0]['args'] == built_in + ['--model', 'test-model', '--settings', settings]
+    assert logs[1]['args'] == built_in + ['--resume', sid, '--model', 'test-model', '--settings', settings]
+
+
+@pytest.mark.parametrize('prompt', ['crash', 'complete-with-child'])
+async def test_process_exit_cleans_descendants(rig, prompt):
+    _, _, executor, _, path = rig
+    records = [r async for r in executor.start(100, prompt)]
+    pids = json.loads((path / 'pids.json').read_text())
+    assert not any(pid in process_table() for pid in pids)
+    if prompt == 'crash':
+        assert any(e.kind == 'error' for r in records for e in r.events)
+
+
+async def test_large_and_unknown_shape_lines_do_not_stop_reader(rig):
+    _, _, executor, _, _ = rig
+    records = [r async for r in executor.start(100, 'large-line')]
+    large = next(r for r in records if isinstance(r.payload, dict) and r.payload.get('type') == 'future_event')
+    assert len(large.payload['payload']) == 9 * 1024 * 1024
+    assert len(large.raw_line) > 9 * 1024 * 1024
+    assert not large.events
+    assert any(e.kind == 'error' for r in records for e in r.events)
+    assert any(e.kind == 'turn_completed' for r in records for e in r.events)
+
+
+async def test_double_fork_is_discovered_after_ancestry_disappears(rig, monkeypatch):
+    import os
+    import signal
+    from eivoh.executors.claude import ProcessTree
+    from conftest import until
+    _, _, executor, _, path = rig
+    original = ProcessTree.snapshot
+    # Deliberately miss every intermediate parent; test the adoption fallback.
+    monkeypatch.setattr(ProcessTree, 'snapshot', lambda self: process_table())
+    async def consume():
+        return [record async for record in executor.start(100, 'double-fork-hang')]
+    job = asyncio.create_task(consume())
+    pid = None
+    try:
+        await until(lambda: (path / 'orphan.pid').exists())
+        pid = int((path / 'orphan.pid').read_text())
+        tree = executor.running[100]
+        await asyncio.sleep(0.1)
+        monkeypatch.setattr(ProcessTree, 'snapshot', original)
+        tree.snapshot()
+        assert pid in tree.known
+        await executor.cancel(100)
+        await asyncio.wait_for(job, 3)
+        assert pid not in process_table()
+    finally:
+        # The unfixed implementation loses this PID: clean up only our fixture.
+        if pid in process_table():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        monkeypatch.setattr(ProcessTree, 'snapshot', original)
+        await executor.cancel(100)
+        await asyncio.wait_for(job, 3)
+        if pid:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+
+@pytest.mark.parametrize('prompt', ['double-fork-crash', 'double-fork-complete'])
+async def test_double_fork_exit_reaps_pipe_holder(rig, prompt):
+    _, _, executor, _, path = rig
+    async def consume():
+        return [record async for record in executor.start(100, prompt)]
+    records = await asyncio.wait_for(consume(), 5)
+    pid = int((path / 'orphan.pid').read_text())
+    assert pid not in process_table()
+    if prompt.endswith('crash'):
+        assert any(e.kind == 'error' for r in records for e in r.events)
+    else:
+        assert any(e.kind == 'turn_completed' for r in records for e in r.events)
+
+
+async def test_supervisors_isolate_concurrent_turns(rig):
+    from conftest import until
+    _, _, executor, _, path = rig
+    other_path = path / 'other'
+    other_path.mkdir()
+    other = ClaudeExecutor(other_path, executor.binary, grace=0.1)
+    async def consume(adapter, run_id):
+        return [r async for r in adapter.start(run_id, 'double-fork-hang')]
+    first = asyncio.create_task(consume(executor, 100))
+    second = asyncio.create_task(consume(other, 200))
+    try:
+        await until(lambda: (path / 'orphan.pid').exists() and (other_path / 'orphan.pid').exists())
+        own_pid = int((path / 'orphan.pid').read_text())
+        other_pid = int((other_path / 'orphan.pid').read_text())
+        await executor.cancel(100)
+        await asyncio.wait_for(first, 3)
+        assert own_pid not in process_table()
+        assert other_pid in process_table()
+        assert not second.done()
+    finally:
+        await other.shutdown()
+        await executor.shutdown()
+        await asyncio.gather(first, second)
+    assert other_pid not in process_table()

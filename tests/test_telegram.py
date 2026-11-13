@@ -1,0 +1,97 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
+
+from eivoh.channels.telegram import TelegramChannel
+
+
+def make_bot():
+    return SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=5)),
+                           edit_message_text=AsyncMock(return_value=True),
+                           delete_message=AsyncMock(return_value=True),
+                           send_chat_action=AsyncMock(return_value=True))
+
+
+async def test_parse_fallback_not_modified_and_ambiguous_send():
+    bot = make_bot()
+    channel = TelegramChannel('unused', 1, bot)
+    bot.send_message.side_effect = [BadRequest("Can't parse entities"), SimpleNamespace(message_id=5)]
+    assert await channel.send('10', '**bold**') == '5'
+    assert bot.send_message.call_args_list[0].kwargs['parse_mode'] == 'HTML'
+    assert bot.send_message.call_args_list[1].kwargs['text'] == 'bold'
+    assert 'parse_mode' not in bot.send_message.call_args_list[1].kwargs
+    bot.edit_message_text.side_effect = BadRequest('Message is not modified')
+    await channel.edit('10', '5', 'bold')
+    bot.send_message.reset_mock()
+    bot.send_message.side_effect = TimedOut('ambiguous')
+    assert await channel.send('10', 'no retry') is None
+    assert bot.send_message.call_count == 1
+
+
+async def test_flood_backoff_serializes_chat(monkeypatch):
+    bot = make_bot()
+    channel = TelegramChannel('unused', 1, bot)
+    monkeypatch.setenv('PTB_TIMEDELTA', '1')
+    bot.edit_message_text.side_effect = [RetryAfter(0), True]
+    entered, release = asyncio.Event(), asyncio.Event()
+    sleeps = []
+    async def sleep(delay):
+        sleeps.append(delay)
+        entered.set()
+        await release.wait()
+    monkeypatch.setattr('eivoh.channels.telegram.asyncio.sleep', sleep)
+    edit = asyncio.create_task(channel.edit('10', '5', 'new'))
+    await entered.wait()
+    typing = asyncio.create_task(channel.typing('10'))
+    assert bot.send_chat_action.call_count == 0
+    release.set()
+    await asyncio.gather(edit, typing)
+    assert bot.edit_message_text.call_count == 2
+    assert bot.send_chat_action.call_count == 1
+    assert sleeps[0] > 0
+
+
+async def test_chunk_edit_grows_and_shrinks():
+    bot = make_bot()
+    counter = 0
+    async def send(**kwargs):
+        nonlocal counter
+        counter += 1
+        return SimpleNamespace(message_id=counter)
+    bot.send_message.side_effect = send
+    channel = TelegramChannel('unused', 1, bot)
+    mid = await channel.send('10', 'short')
+    await channel.edit('10', mid, '```\n' + 'x' * 9000 + '\n```')
+    assert bot.send_message.call_count == 3
+    await channel.edit('10', mid, 'short again')
+    assert bot.delete_message.call_count == 2
+
+
+async def test_poll_owner_private_and_ack_after_journal(rig):
+    gateway, storage, _, _, _ = rig
+    bot = make_bot()
+    channel = TelegramChannel('unused', 1, bot)
+    def update(uid, owner, chat_type, mid, text):
+        return SimpleNamespace(update_id=uid, effective_user=SimpleNamespace(id=owner),
+                               effective_chat=SimpleNamespace(id=10, type=chat_type),
+                               effective_message=SimpleNamespace(message_id=mid, text=text))
+    calls = []
+    async def updates(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return [update(100, 2, 'private', 1, 'ignored'),
+                    update(101, 1, 'group', 2, 'ignored'),
+                    update(102, 1, 'private', 3, 'accepted')]
+        assert kwargs['offset'] == 103
+        assert storage.db.execute("SELECT text FROM inbound").fetchone()[0] == 'accepted'
+        raise asyncio.CancelledError
+    bot.get_updates = updates
+    # No real Telegram transport is needed to test polling admission/ack.
+    async def receive(message):
+        storage.journal(message)
+    with pytest.raises(asyncio.CancelledError):
+        await channel.poll(receive)
+    assert len(storage.pending()) == 1

@@ -1,0 +1,19 @@
+[Unit]
+Description=Eivoh personal chat gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/eivoh/run
+ExecStart=%h/.local/share/eivoh/run/.venv/bin/python -m eivoh
+EnvironmentFile=%h/.config/eivoh/env
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=default.target
