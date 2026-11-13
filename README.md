@@ -376,6 +376,9 @@ numeric order, so recovery can edit them. It preserves task/session/title data.
 Completed legacy turns are not replayed; ambiguous legacy sends without a recorded
 ID cannot be reconstructed. Restoring an older database does not by itself restore
 or remove files.
+Migration 7 adds numeric message-ID expression indexes to inbound and delivery
+rows for displacement lookups; journal contents and delivery identities stay
+unchanged.
 Older releases reject newer schema versions. A rollback needs a
 compatible release or a separately planned database restore.
 Conversations point to one current task among their open tasks; turns retain
@@ -431,8 +434,15 @@ is allowed. Actual attempted visible text is checked across all uncertain previe
 parts, including plaintext fallbacks and tool suffixes. A preview that may already
 contain the final answer preserves that uncertainty, and an uncertain final never
 gets another identity after restart. Final identity creation and adoption commit
-together. Later text chunks are held behind an uncertain
-prefix. File parts retain their own identities. A separate notice explains an
+together. At most once per flush, updated previews and finals move their known
+text parts below newer known messages (ignoring retiring tails and, for previews
+only, other running turns' text previews); arrivals during the replacement batch
+wait for another update, so bottom placement is not unconditional. Moves journal
+deletes before replacement sends, preserve/report ambiguous sends and, on
+permanent delete refusal, retain the old text ID for editing or replace obsolete
+content with a superseded marker (offline coverage; live behavior unverified).
+Later text chunks are held behind an uncertain prefix. File parts retain their
+own identities. A separate notice explains an
 uncertain/refused/pending delivery; the result and snapshots stay in storage.
 This can omit a part that Telegram never received, but avoids blind retries of
 possibly posted sends. It is not exactly-once delivery. A message whose ID was

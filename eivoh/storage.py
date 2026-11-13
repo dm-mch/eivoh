@@ -130,6 +130,10 @@ MIGRATIONS = (
             WHERE outbound.channel='telegram' AND message_id!='' AND message_id NOT GLOB '*[^0-9]*'
                 AND turn.status IN ('queued','running')""",
     ),
+    (
+        "CREATE INDEX inbound_message_number ON inbound(channel,chat_id,CAST(message_id AS INTEGER))",
+        "CREATE INDEX delivery_message_number ON delivery(channel,chat_id,CAST(message_id AS INTEGER))",
+    ),
 )
 
 
@@ -497,6 +501,96 @@ class Storage:
     def delivery_parts(self, channel, chat, logical):
         return self.db.execute("SELECT * FROM delivery WHERE channel=? AND chat_id=? AND logical_id=? ORDER BY id",
                                (channel, chat, logical)).fetchall()
+
+    def delivery_displaced(self, channel, chat, logical):
+        family = [logical]
+        preview = False
+        if logical.startswith('turn:') and logical.split(':')[1].isdecimal():
+            progress = ':'.join(logical.split(':')[:2])
+            if logical in {progress, progress + ':final'}:
+                family = [progress, progress + ':final']
+                preview = logical == progress
+        placeholders = ','.join('?' for _ in family)
+        # +0 prevents SQLite's MAX shortcut from walking the chat-wide numeric
+        # index; the threshold must use the small logical-id subset instead.
+        return bool(self.db.execute(f"""SELECT 1 FROM (
+                SELECT message_id FROM inbound WHERE channel=? AND chat_id=?
+                UNION ALL
+                SELECT message_id FROM delivery WHERE channel=? AND chat_id=?
+                    AND logical_id NOT IN ({placeholders})
+                    AND NOT (? AND EXISTS (SELECT 1 FROM turn WHERE turn.id=delivery.turn_id
+                        AND turn.status='running' AND delivery.logical_id='turn:' || turn.id
+                        AND json_extract(delivery.payload,'$.kind') IN ('text','delete')))
+            ) WHERE message_id!='' AND message_id NOT GLOB '*[^0-9]*'
+                AND CAST(message_id AS INTEGER) > (
+                    SELECT MAX(CAST(message_id AS INTEGER) + 0) FROM delivery
+                    WHERE channel=? AND chat_id=? AND logical_id=?
+                        AND part!='' AND part NOT GLOB '*[^0-9]*'
+                        AND json_extract(payload,'$.kind')='text'
+                        AND message_id!='' AND message_id NOT GLOB '*[^0-9]*') LIMIT 1""",
+            (channel, chat, channel, chat, *family, preview, channel, chat, logical)).fetchone())
+
+    def move_delivery(self, channel, chat, logical):
+        """Retire known text ids atomically; unknown fresh sends keep their evidence."""
+        with self.db:
+            rows = [row for row in self.delivery_parts(channel, chat, logical)
+                    if row['part'].isdecimal() and not row['cancelled']]
+            if not any(row['message_id'] is not None for row in rows):
+                return False
+            if not any(row['state'] == 'pending' or row['state'] == 'unknown' and row['message_id'] is not None for row in rows):
+                return False
+            # A refused delete cannot be retried as a fresh copy on the next
+            # update, or when the final adopts the retained preview id.
+            for row in rows:
+                if row['message_id'] is not None and self.db.execute("SELECT 1 FROM delivery WHERE channel=? AND chat_id=? "
+                        "AND logical_id IN (?,?) AND part=? AND json_extract(payload,'$.retained')=?",
+                        (channel, chat, logical, logical.removesuffix(':final'), f"delete:{row['message_id']}", row['message_id'])).fetchone():
+                    return False
+            if not self.delivery_displaced(channel, chat, logical):
+                return False
+            for row in rows:
+                if row['message_id'] is None:
+                    continue
+                self.retire_delivery(row['id'], commit=False)
+            return True
+
+    def retire_delivery(self, delivery_id, *, commit=True):
+        """Move and shrink share physical cleanup; keep the numeric identity."""
+        with self.db if commit else nullcontext():
+            row = self.delivery(delivery_id)
+            if row['cancelled'] or row['message_id'] is None:
+                return row
+            obsolete = json.loads(row['payload'])['kind'] == 'delete'
+            cleanup = self.prepare_delivery(row['channel'], row['chat_id'], row['logical_id'], f"delete:{row['message_id']}",
+                {'kind': 'delete', 'part': row['part']}, row['task_id'], row['turn_id'], commit=False)
+            self.db.execute("UPDATE delivery SET message_id=?,state=? WHERE id=?",
+                (row['message_id'], 'failed' if obsolete and row['state'] == 'failed' else cleanup['state'], cleanup['id']))
+            self.db.execute("UPDATE delivery SET message_id=NULL,state=?,detail='',revision=revision+1 WHERE id=?",
+                            ('sent' if obsolete else 'pending', row['id']))
+            return self.delivery(cleanup['id'])
+
+    def retain_delivery(self, delivery_id):
+        """Resolve refused cleanup without sending another copy of its text."""
+        with self.db:
+            row = self.delivery(delivery_id)
+            if row['cancelled'] or row['state'] != 'failed':
+                return row
+            payload = json.loads(row['payload'])
+            target = self.db.execute('SELECT * FROM delivery WHERE channel=? AND chat_id=? AND logical_id=? AND part=?',
+                (row['channel'], row['chat_id'], row['logical_id'], payload.get('part'))).fetchone()
+            if (target is not None and not target['cancelled'] and target['state'] == 'pending'
+                    and target['message_id'] is None and json.loads(target['payload'])['kind'] == 'text'):
+                self.db.execute("UPDATE delivery SET message_id=?,revision=revision+1 WHERE id=?", (row['message_id'], target['id']))
+                payload['retained'] = row['message_id']
+                self.db.execute("UPDATE delivery SET payload=?,state='sent',message_id=NULL,detail='Delete refused; retained for editing' WHERE id=?",
+                                (json.dumps(payload, sort_keys=True), row['id']))
+            else:
+                # There is no desired text at this index, or another unknown
+                # send may already carry it. Retire only the known old content.
+                payload = {'kind': 'text', 'text': '[Earlier preview superseded.]', 'retained': row['message_id']}
+                self.db.execute("UPDATE delivery SET payload=?,state='pending',revision=revision+1,detail='Delete refused; retiring old content' WHERE id=?",
+                                (json.dumps(payload, sort_keys=True), row['id']))
+            return self.delivery(delivery_id)
 
     def begin_delivery(self, delivery_id, operation, payload, revision=None):
         with self.db:

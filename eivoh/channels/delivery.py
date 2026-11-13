@@ -57,7 +57,7 @@ class TelegramDelivery:
         self.prepare_text(chat, logical, text, task_id, turn_id, buttons)
         await self.flush(chat, logical)
         rows = self.storage.delivery_parts('telegram', chat, logical)
-        return next((row['message_id'] for row in rows if row['message_id']), None)
+        return next((row['message_id'] for row in rows if row['part'].isdecimal() and row['message_id']), None)
 
     def prepare_text(self, chat, logical, text, task_id=None, turn_id=None, buttons=None, *, commit=True):
         """Save desired content without waiting for an older physical request."""
@@ -77,6 +77,8 @@ class TelegramDelivery:
         An uncertain preview can already contain the whole final part (a fast
         executor, or a plaintext formatting fallback). Such a part stays unknown;
         only positively distinct preview content permits a fresh final send.
+        Moved previews keep the same text rows/attempts, so this also covers an
+        uncertain replacement send. Their pending deletes pass to the final.
         """
         with self.storage.db:
             self._prepare_final(chat, progress, final, text, task_id, turn_id)
@@ -103,13 +105,23 @@ class TelegramDelivery:
             # uncertain different-index part can already contain this answer.
             if missing_evidence or any(target and target in body for body in uncertain):
                 self.storage.db.execute("UPDATE delivery SET state='unknown',detail='An earlier send may already contain this final part' WHERE id=?", (row['id'],))
+                preview = previews.get(row['part'])
+                if preview is not None and preview['message_id'] is not None:
+                    # Another uncertain part covers the final; retire this known
+                    # preview without adopting it or clearing that uncertainty.
+                    delete = self.storage.prepare_delivery('telegram', chat, final, f"delete:{preview['message_id']}",
+                        {'kind': 'delete', 'part': row['part']}, task_id, turn_id, commit=False)
+                    self.storage.db.execute('UPDATE delivery SET message_id=? WHERE id=?', (preview['message_id'], delete['id']))
             elif row['part'] in previews and previews[row['part']]['message_id'] is not None:
                 self.storage.db.execute("UPDATE delivery SET message_id=? WHERE id=?", (previews[row['part']]['message_id'], row['id']))
         for part, preview in previews.items():
             if part not in {row['part'] for row in finals} and preview['message_id'] is not None:
-                row = self.storage.prepare_delivery('telegram', chat, final, part, {'kind': 'delete'}, task_id, turn_id, commit=False)
+                payload = json.loads(preview['payload']) if part.startswith('delete:') else {'kind': 'delete'}
+                row = self.storage.prepare_delivery('telegram', chat, final, part, payload, task_id, turn_id, commit=False)
                 if part not in existing:
                     self.storage.db.execute('UPDATE delivery SET message_id=? WHERE id=?', (preview['message_id'], row['id']))
+                if part.startswith('delete:'):
+                    self.storage.db.execute('UPDATE delivery SET cancelled=1 WHERE id=?', (preview['id'],))
 
     @staticmethod
     def _content(text):
@@ -129,16 +141,42 @@ class TelegramDelivery:
             await self._flush(chat, logical)
 
     async def _flush(self, chat, logical):
-        text_blocked = False
-        for row in self.storage.delivery_parts('telegram', chat, logical):
-            if text_blocked and row['part'].isdecimal():
-                continue
-            await self._part(self.storage.delivery(row['id']))
-            current = self.storage.delivery(row['id'])
-            if current['state'] in {'unknown', 'pending', 'sending'} and row['part'].isdecimal():
-                text_blocked = True  # Never send an answer's tail after an uncertain prefix.
+        moved = self.storage.move_delivery('telegram', chat, logical)
+        while True:
+            text_blocked = False
+            rows = self.storage.delivery_parts('telegram', chat, logical)
+            obsolete = [row for row in rows if row['part'].isdecimal() and row['message_id'] is not None
+                        and not row['cancelled'] and json.loads(row['payload'])['kind'] == 'delete']
+            for row in obsolete:
+                self.storage.retire_delivery(row['id'])
+            if obsolete:
+                rows = self.storage.delivery_parts('telegram', chat, logical)
+            rows.sort(key=lambda row: (0, row['id']) if row['part'].startswith('delete:') else
+                      (1, int(row['part'])) if row['part'].isdecimal() else (2, row['id']))
+            for row in rows:
+                row = self.storage.delivery(row['id'])
+                # Desired text can shrink while an earlier request is awaited.
+                if row['part'].isdecimal() and row['message_id'] is not None and json.loads(row['payload'])['kind'] == 'delete':
+                    row = self.storage.retire_delivery(row['id'])
+                if text_blocked and row['part'].isdecimal() and json.loads(row['payload'])['kind'] != 'delete':
+                    continue
+                if await self._part(row, relocate=not moved):
+                    moved = True
+                    break  # Finish this replacement batch before considering another move.
+                current = self.storage.delivery(row['id'])
+                if row['part'].startswith('delete:'):
+                    if current['state'] == 'failed' and json.loads(current['payload'])['kind'] == 'delete':
+                        await self._part(self.storage.retain_delivery(row['id']))
+                        current = self.storage.delivery(row['id'])
+                    # Delete before send: interrupted cleanup must settle first.
+                    if current['state'] in {'pending', 'sending', 'unknown', 'failed'}:
+                        return
+                if current['state'] in {'unknown', 'pending', 'sending'} and row['part'].isdecimal():
+                    text_blocked = True  # Never send an answer's tail after an uncertain prefix.
+            else:
+                return
 
-    async def _part(self, row):
+    async def _part(self, row, *, relocate=False):
         if row['cancelled'] or row['state'] in {'sent', 'failed'} or (row['state'] == 'unknown' and not row['message_id']):
             return
         payload = json.loads(row['payload'])
@@ -152,6 +190,11 @@ class TelegramDelivery:
             wait = self.channel.blocked_until.get(row['chat_id'], 0) - asyncio.get_running_loop().time()
             if wait > 0:
                 await asyncio.sleep(wait)
+            if self.storage.delivery(row['id'])['cancelled']:
+                return
+            if (relocate and (retry or wait > 0) and kind == 'text' and row['message_id'] and row['part'].isdecimal()
+                    and self.storage.move_delivery(row['channel'], row['chat_id'], row['logical_id'])):
+                return True
             operation = 'delete' if kind == 'delete' else 'edit' if kind == 'text' and row['message_id'] else 'send'
             kwargs = {'chat_id': row['chat_id']}
             blob = None
@@ -198,9 +241,12 @@ class TelegramDelivery:
                     self.storage.delivery_outcome(row['id'], attempt, 'sent', row['message_id'])
                     return
                 if kind == 'text' and row['message_id'] and 'message to edit not found' in reason:
-                    self.storage.delivery_outcome(row['id'], attempt, 'pending', detail='Known message no longer exists')
+                    cleanup = row['part'].startswith('delete:')
+                    self.storage.delivery_outcome(row['id'], attempt, 'sent' if cleanup else 'pending', detail='Known message no longer exists')
                     with self.storage.db:
                         self.storage.db.execute('UPDATE delivery SET message_id=NULL WHERE id=?', (row['id'],))
+                    if cleanup:
+                        return
                     return await self._part(self.storage.delivery(row['id']))
                 if kind == 'text' and payload.get('parse_mode') and any(word in reason for word in ('parse entities', "can't find end", 'unsupported start tag')):
                     self.storage.delivery_outcome(row['id'], attempt, 'pending', detail='Markup refused')
