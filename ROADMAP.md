@@ -61,8 +61,8 @@ Goal: both executors behind one interface and a chat the owner prefers to any ot
 
 Build:
 
-* Codex CLI adapter through `codex exec --json` and `codex exec resume`, one process per turn, cancel by terminating the process tree.
-* Choice of executor per task from the chat; several tasks in one chat with a list and switching. No studied project has a model for several tasks in one chat, so this is our own design.
+* Codex CLI adapter through `codex exec --json` and `codex exec resume`, one process per turn, cancel by terminating the process tree. Built: the CLI runner is shared with Claude; `/new codex` and `/new claude` choose the executor of a new task. Per-task model choice through `/model` is built: same-executor changes keep the native session, and cross-executor changes pass a bounded transcript of earlier turns into a new session. Oversized newest turns retain marked user/assistant excerpts. The assembled prompt is journaled before launch so recovery retains the handoff even after session creation; older pending turns reconstruct it when needed. Launch model settings and their sources are separate from observed Claude model reports. Migration, routing, context handoff and recovery have offline fake-executor coverage. Observed once on the installed service (2026-11-13): `/model` by name and by number, a Claude to Codex switch and a switch back, each continuing the task from the passed transcript, and Codex turns resuming one thread. Recovery of a handoff after a restart is unverified in live use. A live test with codex-cli 0.167.2 passed (turn, resume with the same thread, `/stop` during a command without orphans).
+* Several tasks in one chat with a list and switching. No studied project has a model for several tasks in one chat, so this is our own design.
 * Voice messages in, files and images in and out. Voice in is built early: Telegram voice and audio go through a provider-neutral transcriber (`EIVOH_STT`; the first provider is the Soniox async API, `stt-async-v6`) before journaling, and the transcript is echoed to the chat. On 15–93 s notes it took 3–6 s; the Soniox real-time WebSocket took about as long as the audio, so it is not used for recorded files.
 * Reliability: one consumer per bot token with a local lock and recovery from a polling conflict, removal of duplicate updates after a restart, sending rules that do not post duplicates.
 
@@ -72,7 +72,7 @@ Reuse:
 * Routing schema modelled on letta-code `src/channels/types.ts` (Apache-2.0) and openclaw `src/routing/session-key.ts` (MIT): identity, conversation, task, active task of a conversation, executor session, inbound journal. Group chats never share a key with private chats.
 * Reference: hermes-agent for the token lock, conflict recovery and the processed-update journal.
 
-Confirm by test: the Codex event names and the thread id field in the installed version; how sandbox and approval settings are passed on resume; that Codex uses the subscription login.
+Confirm by test: the Codex event names and the thread id field in the installed version; how sandbox and approval settings are passed on resume; that Codex uses the subscription login. Confirmed by probes of codex-cli 0.167.2: `thread.started.thread_id`, item and turn events without text deltas; `exec resume` takes `--dangerously-bypass-approvals-and-sandbox` but has no `-C` or `--sandbox`, so the cwd selects the workspace; ChatGPT login is used; SIGTERM ends codex at once but leaves its running command orphaned, and the session resumes after SIGTERM or SIGKILL.
 
 Done when: one chat holds a task on Claude and a task on Codex and the owner switches between them; a voice message becomes a task; a second process started with the same token does not break the first.
 
@@ -106,6 +106,7 @@ Build:
 * A calibration report built from the records: forecasts against observed results, by task type, executor and model.
 * Choice of executor, model and skills for a task on the basis of experience.
 * Tracking of subscription limits and costs, with unknown consumption marked as unknown.
+* Proposal (2026-11-13, accepted by the owner as a direction, not yet designed): nested subagents through Eivoh. An executor asks Eivoh to start a subagent on any available model, Claude or Codex, for example with an `eivoh spawn --model <model> <task>` command. The subagent is a child task with its own executor session and raw events in storage, receives the same capability, and can start its own subagents. A depth limit and a budget for the whole task tree come from limit tracking; cancelling a task cancels its subtree. Until then, executors that start other CLIs directly do so outside Eivoh's journal and limits; `/stop` still ends them as descendants of the executor process.
 
 Reuse: a ready-made model without fine-tuning performs these roles; a fast typed-decision model such as Jev is a candidate to evaluate when the stage starts.
 

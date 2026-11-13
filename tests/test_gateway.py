@@ -242,3 +242,60 @@ async def test_crash_before_resume_process_emits_id_keeps_original_prompt(rig):
     assert prompts(path)[-1]['prompt'] == RESTART_PROMPT + '\n\nOriginal request:\nnew request before crash'
     assert prompts(path)[-1]['resume'] == original_sid
     assert storage.turn_for(2)['status'] == 'completed'
+
+
+async def test_model_same_executor_is_fifo_and_keeps_session(rig):
+    gateway, storage, _, channel, path = rig
+    await gateway.receive(inbound(1, '/model haiku'))
+    await gateway.receive(inbound(2, 'first'))
+    await gateway.receive(inbound(3, '/model claude-sonnet-5-5'))
+    await gateway.receive(inbound(4, 'second'))
+    await gateway.idle()
+    calls = prompts(path)
+    assert calls[0]['args'][-2:] == ['--model', 'haiku']
+    assert calls[1]['args'][-2:] == ['--model', 'claude-sonnet-5-5']
+    assert calls[1]['resume'] == calls[0]['sid']
+    assert [call['prompt'] for call in calls] == ['first', 'second']
+    assert storage.turn_for(1) is storage.turn_for(3) is None
+    assert any('Model: claude / claude-sonnet-5-5. Context kept (same session).' == text
+               for _, text in channel.sent)
+    assert storage.db.execute('SELECT COUNT(*) FROM turn').fetchone()[0] == 2
+    assert storage.db.execute('SELECT COUNT(*) FROM task').fetchone()[0] == 1
+    await gateway.receive(inbound(5, '/new'))
+    await gateway.receive(inbound(6, 'fresh'))
+    await gateway.idle()
+    assert prompts(path)[-1]['resume'] is None
+    assert prompts(path)[-1]['prompt'] == 'fresh'
+    assert storage.active_task(1)['model'] is None
+
+
+async def test_model_listing_and_number_snapshot(rig, monkeypatch):
+    gateway, storage, _, channel, _ = rig
+    await gateway.receive(inbound(1, '/model'))
+    await gateway.idle()
+    text = channel.sent[-1][1]
+    assert text.startswith('Model: claude / default.')
+    assert 'claude:' in text and 'codex:' in text
+    assert '1. fable' in text and '6. claude-opus-5-5' in text
+    assert storage.turn_for(1) is None and storage.active_task(1) is None
+    monkeypatch.setenv('EIVOH_CLAUDE_MODELS', 'changed-model')
+    await gateway.receive(inbound(2, '/model 6'))
+    await gateway.idle()
+    assert storage.active_task(1)['model'] == 'claude-opus-5-5'
+    assert storage.db.execute('SELECT COUNT(*) FROM turn').fetchone()[0] == 0
+    await gateway.receive(inbound(3, '/model'))
+    await gateway.idle()
+    assert channel.sent[-1][1].startswith('Model: claude / claude-opus-5-5.')
+    assert '1. changed-model' in channel.sent[-1][1]
+
+
+async def test_stop_cancels_queued_model_command(rig):
+    gateway, storage, _, _, path = rig
+    await gateway.receive(inbound(1, 'hang'))
+    await until(lambda: (path / 'pids.json').exists())
+    await gateway.receive(inbound(2, '/model opus'))
+    await gateway.receive(inbound(3, '/stop'))
+    await gateway.idle()
+    assert storage.inbound(2)['state'] == 'cancelled'
+    assert storage.active_task(1)['model'] is None
+    assert storage.turn_for(2) is None

@@ -56,3 +56,50 @@ async def test_live_turn_resume_and_cancel(tmp_path):
     finally:
         await gateway.shutdown()
         store.close()
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get('EIVOH_LIVE') != '1', reason='Set EIVOH_LIVE=1 to run real Codex')
+async def test_live_codex_turn_resume_and_cancel(tmp_path):
+    from eivoh.executors.codex import CodexExecutor
+    store = Storage(tmp_path / 'live.db', 'codex')
+    executor = CodexExecutor(tmp_path, os.environ.get('EIVOH_CODEX_BIN', 'codex'), model='gpt-6.1-sol',
+                             extra_args=('-c', 'model_reasoning_effort="low"'))
+    channel = FakeChannel()
+    gateway = Gateway(store, executor, {'fake': channel}, edit_interval=0.2)
+    try:
+        await gateway.start()
+        await gateway.receive(inbound(1, 'Remember the word lantern. Reply only: lantern. Do not run commands.'))
+        await asyncio.wait_for(gateway.idle(), 180)
+        first = store.turn_for(1)
+        assert first['status'] == 'completed' and first['session_id']
+        await gateway.receive(inbound(2, 'What word did I ask you to remember? Reply only that word. Do not run commands.'))
+        await asyncio.wait_for(gateway.idle(), 180)
+        second = store.turn_for(2)
+        assert second['status'] == 'completed' and second['session_id'] == first['session_id']
+        assert 'lantern' in store.stored_result(second['id'])[0].lower()
+        await gateway.receive(inbound(3, 'Run exactly this shell command and wait for it: python3 -c "import time; time.sleep(61)"'))
+        tracked = {}
+        def sleeping():
+            for tree in executor.running.values():
+                table = tree.snapshot()
+                tracked.update(tree.known)
+                for pid, start in tree.known.items():
+                    if pid in table and table[pid][1] == start:
+                        try:
+                            if b'time.sleep(61)' in Path(f'/proc/{pid}/cmdline').read_bytes() and Path(f'/proc/{pid}/comm').read_text().strip().startswith('python'):
+                                return True
+                        except OSError:
+                            pass
+            return False
+        await until(sleeping, timeout=180)
+        await gateway.receive(inbound(4, '/stop'))
+        await gateway.idle()
+        assert store.turn_for(3)['status'] == 'cancelled'
+        def no_orphans():
+            table = process_table()
+            return all(pid not in table or table[pid][1] != start for pid, start in tracked.items())
+        await until(no_orphans)
+    finally:
+        await gateway.shutdown()
+        store.close()

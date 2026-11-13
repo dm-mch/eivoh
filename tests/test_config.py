@@ -35,8 +35,8 @@ def test_config(monkeypatch, tmp_path):
 @pytest.mark.parametrize(('value', 'expected'), [
     ('', ()),
     ('   ', ()),
-    ('''--settings '{"enabledPlugins":{"example-plugin@example-marketplace":false}}' --model "a model"''',
-     ('--settings', '{"enabledPlugins":{"example-plugin@example-marketplace":false}}', '--model', 'a model')),
+    ('''--settings '{"enabledPlugins":{"example-plugin@example-marketplace":false}}' ''',
+     ('--settings', '{"enabledPlugins":{"example-plugin@example-marketplace":false}}')),
 ])
 def test_claude_args_parsing(monkeypatch, tmp_path, value, expected):
     monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
@@ -51,6 +51,7 @@ def test_claude_args_parsing(monkeypatch, tmp_path, value, expected):
     '--print', '--print=prompt', '--output-format json', '--output-format=json',
     '--input-format json', '--input-format=json',
     '--permission-mode plan', '--permission-mode=plan',
+    '--model opus', '--model=opus',
 ])
 def test_claude_args_reject_owned_flags(monkeypatch, tmp_path, value):
     monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
@@ -81,3 +82,25 @@ def test_speech_provider_selection():
         provider_from_env({'EIVOH_STT': 'whisper'})
     assert make_transcriber(None, {}) is None
     assert type(make_transcriber('soniox', {'SONIOX_API_KEY': 'k'})).__name__ == 'SonioxTranscriber'
+
+
+def test_codex_config(monkeypatch, tmp_path):
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
+    for key in ('EIVOH_DEFAULT_EXECUTOR', 'EIVOH_CODEX_BIN', 'EIVOH_CODEX_MODEL', 'EIVOH_CODEX_ARGS', 'EIVOH_STT', 'SONIOX_API_KEY'):
+        monkeypatch.delenv(key, raising=False)
+    config = Config.from_env()
+    assert (config.default_executor, config.codex_bin, config.codex_model, config.codex_args) == ('claude', 'codex', None, ())
+    monkeypatch.setenv('EIVOH_DEFAULT_EXECUTOR', 'Codex')
+    monkeypatch.setenv('EIVOH_CODEX_ARGS', '-c model_reasoning_effort="high"')
+    config = Config.from_env()
+    assert config.default_executor == 'codex' and config.codex_args == ('-c', 'model_reasoning_effort=high')
+    for bad in ('-C /tmp', 'resume', '--cd=/tmp', '--model model', '--model=model', '-m model', '-mmodel'):
+        monkeypatch.setenv('EIVOH_CODEX_ARGS', bad)
+        with pytest.raises(ValueError, match='adapter-owned'):
+            Config.from_env()
+    monkeypatch.setenv('EIVOH_CODEX_ARGS', '')
+    monkeypatch.setenv('EIVOH_DEFAULT_EXECUTOR', 'gemini')
+    with pytest.raises(ValueError, match='EIVOH_DEFAULT_EXECUTOR'):
+        Config.from_env()

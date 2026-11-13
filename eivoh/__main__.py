@@ -6,6 +6,7 @@ import signal
 from .channels.telegram import TelegramChannel
 from .config import Config
 from .executors.claude import ClaudeExecutor
+from .executors.codex import CodexExecutor
 from .gateway import Gateway
 from .speech import make_transcriber
 from .storage import Storage
@@ -13,12 +14,17 @@ from .storage import Storage
 
 async def serve(config: Config):
     os.umask(0o077)
-    storage = Storage(config.state_dir / "eivoh.sqlite3")
-    executor = ClaudeExecutor(config.workdir, config.claude_bin, config.claude_model,
-                              config.permission_mode, extra_args=config.claude_args)
+    storage = Storage(config.state_dir / "eivoh.sqlite3", config.default_executor)
+    executors = {
+        "claude": ClaudeExecutor(config.workdir, config.claude_bin, config.claude_model,
+                                 config.permission_mode, extra_args=config.claude_args),
+        "codex": CodexExecutor(config.workdir, config.codex_bin, config.codex_model,
+                               extra_args=config.codex_args),
+    }
+    executor = executors.pop(config.default_executor)
     transcriber = make_transcriber(config.stt_provider, os.environ)
     channel = TelegramChannel(config.telegram_token, config.owner_id, transcriber=transcriber)
-    gateway = Gateway(storage, executor, {"telegram": channel})
+    gateway = Gateway(storage, executor, {"telegram": channel}, executors=executors)
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     def stop_requested():

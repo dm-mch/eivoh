@@ -43,11 +43,13 @@ MIGRATIONS = (
         """CREATE TRIGGER raw_event_no_delete BEFORE DELETE ON raw_event
                 BEGIN SELECT RAISE(ABORT, 'raw events are append-only'); END;""",
     ),
+    ("ALTER TABLE task ADD COLUMN model TEXT",),
 )
 
 
 class Storage:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, default_executor="claude"):
+        self.default_executor = default_executor
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
@@ -83,7 +85,7 @@ class Storage:
             if not cur.rowcount:
                 return None
             inbound_id = cur.lastrowid
-            if command(message.text) not in {"/stop", "/new"}:
+            if command(message.text) not in {"/stop", "/new", "/model"}:
                 active = self.db.execute("SELECT active_task_id FROM conversation WHERE id=?", (conv,)).fetchone()[0]
                 if active is None:
                     active = self._create_task(conv)
@@ -119,10 +121,12 @@ class Storage:
             self.db.execute("UPDATE turn SET status='running' WHERE id=?", (turn["id"],))
             self.db.execute("UPDATE inbound SET state='running' WHERE id=?", (inbound_id,))
         claimed = dict(self.turn_for(inbound_id))
-        # Retain the ID observed for this turn as evidence; otherwise resume
-        # the task's current session. Recovery always includes the request.
-        previous = self.db.execute("SELECT session_id FROM task WHERE id=?", (claimed["task_id"],)).fetchone()[0]
-        claimed["resume_id"] = claimed["session_id"] or previous
+        # The turn's observed ID remains evidence; routing, including recovery,
+        # uses the task's current session, executor and model.
+        task = self.db.execute("SELECT session_id, executor, model FROM task WHERE id=?", (claimed["task_id"],)).fetchone()
+        claimed["resume_id"] = task["session_id"]
+        claimed["executor"] = task["executor"]
+        claimed["model"] = task["model"]
         return claimed, recovering
 
     def append(self, turn_id: int, record: Record, *, allow_result=True):
@@ -144,17 +148,93 @@ class Storage:
             self.db.execute("UPDATE inbound SET state=? WHERE id=(SELECT inbound_id FROM turn WHERE id=?) AND state != 'cancelled'",
                             ("cancelled" if status == "cancelled" else "done", turn_id))
 
-    def _create_task(self, conversation_id):
-        task_id = self.db.execute("INSERT INTO task(conversation_id) VALUES (?)", (conversation_id,)).lastrowid
+    def _create_task(self, conversation_id, executor=None, model=None):
+        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model) VALUES (?,?,?)",
+                                  (conversation_id, executor or self.default_executor, model)).lastrowid
         self.db.execute("UPDATE conversation SET active_task_id=? WHERE id=?", (task_id, conversation_id))
         return task_id
 
-    def new_task(self, inbound_id):
+    def new_task(self, inbound_id, executor=None):
         with self.db:
             row = self.inbound(inbound_id)
             self.db.execute("UPDATE task SET status='closed' WHERE id=(SELECT active_task_id FROM conversation WHERE id=?)", (row["conversation_id"],))
-            self._create_task(row["conversation_id"])
+            self._create_task(row["conversation_id"], executor)
             self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+
+    def finish_command(self, inbound_id):
+        with self.db:
+            self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+
+    def active_task(self, conversation_id):
+        return self.db.execute("SELECT task.* FROM task JOIN conversation ON task.id=conversation.active_task_id WHERE conversation.id=?",
+                               (conversation_id,)).fetchone()
+
+    def set_model(self, inbound_id, executor, model):
+        """Change routing and consume the FIFO command in the same transaction."""
+        with self.db:
+            row = self.inbound(inbound_id)
+            task = self.active_task(row["conversation_id"])
+            switched = task is not None and task["executor"] != executor
+            if task is None:
+                self._create_task(row["conversation_id"], executor, model)
+            else:
+                self.db.execute("UPDATE task SET executor=?,model=?,session_id=? WHERE id=?",
+                                (executor, model, None if switched else task["session_id"], task["id"]))
+            self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+        return self.active_task(row["conversation_id"]), switched
+
+    def transcript(self, task_id, before_inbound_id, limit=30000):
+        """Recent whole turns, or excerpts of the newest oversized turn."""
+        limit = max(0, limit)
+        blocks, size, truncated, newest = [], 0, False, None
+        rows = self.db.execute("SELECT turn.id,inbound.text FROM turn JOIN inbound ON inbound.id=turn.inbound_id "
+                               "WHERE turn.task_id=? AND turn.inbound_id<? AND (turn.status IN ('completed','failed') "
+                               "OR (turn.status='cancelled' AND EXISTS (SELECT 1 FROM raw_event WHERE turn_id=turn.id))) "
+                               "ORDER BY turn.inbound_id DESC",
+                               (task_id, before_inbound_id))
+        for row in rows:
+            result = self.stored_result(row["id"])
+            answer = result[0] if result is not None else "[No stored final answer.]"
+            if newest is None:
+                newest = (row['text'], answer)
+            block = f"User:\n{row['text']}\n\nAssistant:\n{answer}\n\n"
+            if size + len(block) > limit:
+                truncated = True
+                break
+            blocks.append(block)
+            size += len(block)
+        notice = ""
+        if truncated:
+            notice = "[Transcript truncated: older turns or text omitted.]\n\n"[:limit]
+            while blocks and size + len(notice) > limit:
+                size -= len(blocks.pop())
+            if not blocks and newest is not None:
+                block = excerpt_turn(*newest, limit - len(notice))
+                if block:
+                    blocks.append(block)
+        text = notice + "".join(reversed(blocks))
+        return text, len(blocks), truncated
+
+    def prepare_prompt(self, turn, request):
+        """Journal the original assembled input before launch; reuse on recovery."""
+        for row in self.db.execute("SELECT payload FROM raw_event WHERE turn_id=? AND stream='meta' ORDER BY sequence",
+                                   (turn['id'],)):
+            payload = json.loads(row[0])
+            if isinstance(payload, dict) and payload.get('type') == 'turn_prompt':
+                return payload['prompt']
+        # Old pending turns have no prompt record. A newly observed session is
+        # not proof that the first prompt (including its handoff) was received.
+        # An earlier turn sharing the session distinguishes an ordinary resume.
+        prior_session = turn['resume_id'] and self.db.execute(
+            "SELECT 1 FROM turn WHERE task_id=? AND inbound_id<? AND session_id=? LIMIT 1",
+            (turn['task_id'], turn['inbound_id'], turn['resume_id'])).fetchone()
+        prompt = request
+        if not prior_session:
+            transcript, _, _ = self.transcript(turn['task_id'], turn['inbound_id'])
+            if transcript:
+                prompt = f"Earlier conversation in this task (transcript from Eivoh):\n\n{transcript}End of transcript.\n\nCurrent request:\n{request}"
+        self.append(turn['id'], Record(None, {'type': 'turn_prompt', 'prompt': prompt}, stream='meta'))
+        return prompt
 
     def stored_result(self, turn_id):
         """Replay normalized events after a crash, without invoking the executor."""
@@ -173,7 +253,7 @@ class Storage:
                         text += data["text"]
                     deltas = False
                 elif kind == "error":
-                    error = str(data.get("message", "Executor error"))
+                    error = error or str(data.get("message", "Executor error"))
                 elif kind == "turn_completed":
                     completed = True
                     text = data.get("text") or text
@@ -199,3 +279,28 @@ class Storage:
 
 def command(text):
     return text.strip().split(maxsplit=1)[0].split("@", 1)[0] if text.strip() else ""
+
+
+def excerpt_turn(user, assistant, limit):
+    """Keep both roles and each text's beginning/end, including marker costs."""
+    marker = "\n[Text truncated]\n"
+    overhead = len("User:\n\n\nAssistant:\n\n\n")
+    budget = limit - overhead
+    minimum = [min(len(text), len(marker) + 2) for text in (user, assistant)]
+    if budget < sum(minimum):
+        return ""  # Too small to show both roles and honest excerpts.
+    user_budget = min(len(user), max(minimum[0], budget // 2))
+    assistant_budget = min(len(assistant), budget - user_budget)
+    if assistant_budget < minimum[1]:
+        user_budget -= minimum[1] - assistant_budget
+        assistant_budget = minimum[1]
+    user_budget = min(len(user), budget - assistant_budget)
+
+    def trim(text, available):
+        if len(text) <= available:
+            return text
+        keep = available - len(marker)
+        head = (keep + 1) // 2
+        return text[:head] + marker + text[-(keep - head):]
+
+    return f"User:\n{trim(user, user_budget)}\n\nAssistant:\n{trim(assistant, assistant_budget)}\n\n"

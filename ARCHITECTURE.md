@@ -21,6 +21,7 @@ Predictor, Strategy Policy and Learner are roles, not trained models. They are p
 * Routing distinguishes the user, the conversation, the task and the executor's native session. Only explicitly matched accounts are linked; private and group contexts are not mixed.
 * The gateway is thin: a channel, routing, an executor adapter and state storage. Memory, skills and tools stay with the executors and in Eivoh's files. Codex and Claude are connected through one adapter interface.
 * The adapters for the real Codex and Claude CLIs support the available operations: start, session continuation, streaming output and cancellation. Session resume and prompt cache are reused where possible but accounted for separately: continuing a session does not prove caching. Support and effect are verified against the CLI and the provider.
+* Proposed: executors can start subagents through Eivoh on any available model and executor, nested to any depth within a depth limit and a budget. A subagent is a child task routed through the same adapter interface and journal; see V4 in [ROADMAP.md](ROADMAP.md).
 
 # Memory and resources
 

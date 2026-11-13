@@ -5,6 +5,7 @@ import logging
 
 from .channels.base import Channel, Inbound
 from .executors.base import Executor
+from .models import catalog, resolve
 from .storage import Storage, command
 
 log = logging.getLogger(__name__)
@@ -72,12 +73,16 @@ class Reply:
 
 class Gateway:
     def __init__(self, storage: Storage, executor: Executor, channels: dict[str, Channel],
-                 edit_interval=1.5, typing_interval=4, max_recoveries=3):
-        self.storage, self.executor, self.channels = storage, executor, channels
+                 edit_interval=1.5, typing_interval=4, max_recoveries=3, executors=None):
+        # `executor` is the default one; `executors` adds named alternatives.
+        self.default_executor = storage.default_executor
+        self.executors = {**(executors or {}), self.default_executor: executor}
+        self.storage, self.channels = storage, channels
         self.edit_interval, self.typing_interval = edit_interval, typing_interval
         self.max_recoveries = max_recoveries
         self.workers = {}
         self.locks = {}
+        self.model_catalogs = {}  # Numbers refer to the last list shown in this process.
         self.closing = False
 
     async def start(self):
@@ -100,6 +105,18 @@ class Gateway:
                 await self._stop(row)
             self._kick(conv)
 
+    @property
+    def executor(self):
+        return self.executors[self.default_executor]
+
+    @executor.setter
+    def executor(self, value):
+        self.executors[self.default_executor] = value
+
+    async def _cancel_run(self, run_id):
+        # Run ids are turn ids, unique across executors; cancel is a no-op elsewhere.
+        await asyncio.gather(*(e.cancel(run_id) for e in self.executors.values()))
+
     def _kick(self, conv):
         if not self.closing and (conv not in self.workers or self.workers[conv].done()):
             self.workers[conv] = asyncio.create_task(self._work(conv))
@@ -111,7 +128,7 @@ class Gateway:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
         for run_id, _ in active:
-            await self.executor.cancel(run_id)
+            await self._cancel_run(run_id)
         description = f"Stopped task(s) {', '.join(str(task_id) for _, task_id in active)}." if active else "No running task to stop."
         await safe_call(self.channels[row["channel"]].send, row["chat_id"],
                         f"{description} Cancelled {queued} queued message(s). Send a new message to continue, or /new for a fresh session.")
@@ -128,8 +145,17 @@ class Gateway:
                 # priority-command lock. Its handler owns cancellation.
                 return
             if command(row["text"]) == "/new":
-                self.storage.new_task(row["id"])
-                await safe_call(channel.send, row["chat_id"], "New task. Your next message starts its executor session.")
+                parts = row["text"].split()
+                name = parts[1].lower() if len(parts) > 1 else self.default_executor
+                if name not in self.executors:
+                    self.storage.finish_command(row["id"])
+                    await safe_call(channel.send, row["chat_id"], f"Unknown executor `{name}`. Available: {', '.join(sorted(self.executors))}.")
+                    continue
+                self.storage.new_task(row["id"], name)
+                await safe_call(channel.send, row["chat_id"], f"New task on {name}. Your next message starts its executor session.")
+                continue
+            if command(row["text"]) == "/model":
+                await self._model(row, channel)
                 continue
             pending_turn = self.storage.turn_for(row["id"])
             result = self.storage.stored_result(pending_turn["id"])
@@ -149,6 +175,54 @@ class Gateway:
                 continue
             await self._run(row, turn, recovering)
 
+    async def _model(self, row, channel):
+        parts = row["text"].split(maxsplit=1)
+        conv = row["conversation_id"]
+        if len(parts) == 1:
+            task = self.storage.active_task(conv)
+            name = task["executor"] if task else self.default_executor
+            model = task["model"] if task else None
+            choices = catalog()
+            self.model_catalogs[conv] = choices
+            lines = [f"Model: {name} / {model or 'default'}."]
+            number = 0
+            for executor, models in choices.items():
+                lines.append(f"\n{executor}:")
+                for model_id, description in models:
+                    number += 1
+                    lines.append(f"{number}. {model_id}" + (f" — {description}" if description else ""))
+                if not models:
+                    lines.append("No models available.")
+            lines.append("\nChoose with /model <name or number>.")
+            reply = "\n".join(lines)
+            self.storage.finish_command(row["id"])
+        else:
+            try:
+                choice = parts[1].strip()
+                choices = None
+                if choice.isdecimal():
+                    choices = self.model_catalogs.get(conv)
+                    if choices is None:
+                        raise ValueError("Use /model to list numbered choices first (also after a restart).")
+                name, model = resolve(choice, choices)
+                if name not in self.executors:
+                    raise ValueError(f"Executor {name} is not configured.")
+            except ValueError as exc:
+                self.storage.finish_command(row["id"])
+                reply = str(exc)
+            else:
+                task, switched = self.storage.set_model(row["id"], name, model)
+                if switched:
+                    _, count, truncated = self.storage.transcript(task["id"], row["id"])
+                    reply = f"Switched to {name} / {model}; context will be passed as a transcript of {count} earlier turns."
+                    if truncated:
+                        reply += " Transcript truncated: older turns or parts of the newest turn omitted."
+                elif task["session_id"]:
+                    reply = f"Model: {name} / {model}. Context kept (same session)."
+                else:
+                    reply = f"Model: {name} / {model}. Your next message starts its executor session."
+        await safe_call(channel.send, row["chat_id"], reply)
+
     async def _typing(self, channel, chat):
         # Studied reference: nanobot (MIT), nanobot/channels/telegram/runtime.py.
         # Own generic implementation; no copied source.
@@ -163,12 +237,17 @@ class Gateway:
         text, tool, error = "", "", None
         completed = False
         current_deltas = False
-        prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{row['text']}" if recovering and turn["resume_id"] else row["text"]
         try:
+            prompt = self.storage.prepare_prompt(turn, row['text'])
+            if recovering and turn['resume_id']:
+                prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{prompt}"
             if recovering:
                 await safe_call(channel.send, chat, f"Service restarted; recovering task {turn['task_id']} (attempt {turn['recovery_count']}/{self.max_recoveries}).")
-            stream = (self.executor.resume(turn["id"], turn["resume_id"], prompt)
-                      if turn["resume_id"] else self.executor.start(turn["id"], prompt))
+            executor = self.executors.get(turn["executor"])
+            if executor is None:
+                raise RuntimeError(f"Executor {turn['executor']} is not configured")
+            stream = (executor.resume(turn["id"], turn["resume_id"], prompt, model=turn["model"])
+                      if turn["resume_id"] else executor.start(turn["id"], prompt, model=turn["model"]))
             async def consume():
                 nonlocal text, tool, error, completed, current_deltas
                 async with aclosing(stream):
@@ -190,7 +269,8 @@ class Gateway:
                             elif event.kind == "approval_requested":
                                 tool = "Permission denied; change executor permissions explicitly if needed."
                             elif event.kind == "error":
-                                error = str(data.get("message", "Executor error"))
+                                # Keep the first error: later ones (exit code) are consequences.
+                                error = error or str(data.get("message", "Executor error"))
                             elif event.kind == "turn_completed":
                                 completed = data["status"] == "completed"
                                 # Result is the authoritative final answer (no duplicated deltas).
@@ -204,7 +284,7 @@ class Gateway:
             except asyncio.CancelledError:
                 # Let the reader persist all buffered lines after terminating the
                 # tree. Cancelling the iterator itself would discard its queue.
-                await self.executor.cancel(turn["id"])
+                await executor.cancel(turn["id"])
                 await consumer
                 raise
             if self.closing:
@@ -229,7 +309,7 @@ class Gateway:
             typing.cancel()
             await asyncio.gather(typing, return_exceptions=True)
             await reply.cancel()
-            await self.executor.cancel(turn["id"])
+            await self._cancel_run(turn["id"])
 
     async def idle(self):
         """Wait for accepted work; useful to embedding callers and tests."""
@@ -245,4 +325,4 @@ class Gateway:
         for job in self.workers.values():
             job.cancel()
         await asyncio.gather(*self.workers.values(), return_exceptions=True)
-        await self.executor.shutdown()
+        await asyncio.gather(*(e.shutdown() for e in self.executors.values()))
