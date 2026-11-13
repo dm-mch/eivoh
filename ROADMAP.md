@@ -61,8 +61,8 @@ Goal: both executors behind one interface and a chat the owner prefers to any ot
 
 Build:
 
-* Codex CLI adapter through `codex exec --json` and `codex exec resume`, one process per turn, cancel by terminating the process tree.
-* Choice of executor per task from the chat; several tasks in one chat with a list and switching. No studied project has a model for several tasks in one chat, so this is our own design.
+* Codex CLI adapter through `codex exec --json` and `codex exec resume`, one process per turn, cancel by terminating the process tree. Built: the CLI runner is shared with Claude; `/new codex` and `/new claude` choose the executor of a new task. A live test with codex-cli 0.167.2 passed (turn, resume with the same thread, `/stop` during a command without orphans).
+* Several tasks in one chat with a list and switching. No studied project has a model for several tasks in one chat, so this is our own design.
 * Voice messages in, files and images in and out. Voice in is built early: Telegram voice and audio go through a provider-neutral transcriber (`EIVOH_STT`; the first provider is the Soniox async API, `stt-async-v6`) before journaling, and the transcript is echoed to the chat. On 15–93 s notes it took 3–6 s; the Soniox real-time WebSocket took about as long as the audio, so it is not used for recorded files.
 * Reliability: one consumer per bot token with a local lock and recovery from a polling conflict, removal of duplicate updates after a restart, sending rules that do not post duplicates.
 
@@ -72,7 +72,7 @@ Reuse:
 * Routing schema modelled on letta-code `src/channels/types.ts` (Apache-2.0) and openclaw `src/routing/session-key.ts` (MIT): identity, conversation, task, active task of a conversation, executor session, inbound journal. Group chats never share a key with private chats.
 * Reference: hermes-agent for the token lock, conflict recovery and the processed-update journal.
 
-Confirm by test: the Codex event names and the thread id field in the installed version; how sandbox and approval settings are passed on resume; that Codex uses the subscription login.
+Confirm by test: the Codex event names and the thread id field in the installed version; how sandbox and approval settings are passed on resume; that Codex uses the subscription login. Confirmed by probes of codex-cli 0.167.2: `thread.started.thread_id`, item and turn events without text deltas; `exec resume` takes `--dangerously-bypass-approvals-and-sandbox` but has no `-C` or `--sandbox`, so the cwd selects the workspace; ChatGPT login is used; SIGTERM ends codex at once but leaves its running command orphaned, and the session resumes after SIGTERM or SIGKILL.
 
 Done when: one chat holds a task on Claude and a task on Codex and the owner switches between them; a voice message becomes a task; a second process started with the same token does not break the first.
 

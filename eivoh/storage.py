@@ -47,7 +47,8 @@ MIGRATIONS = (
 
 
 class Storage:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, default_executor="claude"):
+        self.default_executor = default_executor
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
@@ -121,8 +122,9 @@ class Storage:
         claimed = dict(self.turn_for(inbound_id))
         # Retain the ID observed for this turn as evidence; otherwise resume
         # the task's current session. Recovery always includes the request.
-        previous = self.db.execute("SELECT session_id FROM task WHERE id=?", (claimed["task_id"],)).fetchone()[0]
-        claimed["resume_id"] = claimed["session_id"] or previous
+        task = self.db.execute("SELECT session_id, executor FROM task WHERE id=?", (claimed["task_id"],)).fetchone()
+        claimed["resume_id"] = claimed["session_id"] or task["session_id"]
+        claimed["executor"] = task["executor"]
         return claimed, recovering
 
     def append(self, turn_id: int, record: Record, *, allow_result=True):
@@ -144,16 +146,21 @@ class Storage:
             self.db.execute("UPDATE inbound SET state=? WHERE id=(SELECT inbound_id FROM turn WHERE id=?) AND state != 'cancelled'",
                             ("cancelled" if status == "cancelled" else "done", turn_id))
 
-    def _create_task(self, conversation_id):
-        task_id = self.db.execute("INSERT INTO task(conversation_id) VALUES (?)", (conversation_id,)).lastrowid
+    def _create_task(self, conversation_id, executor=None):
+        task_id = self.db.execute("INSERT INTO task(conversation_id,executor) VALUES (?,?)",
+                                  (conversation_id, executor or self.default_executor)).lastrowid
         self.db.execute("UPDATE conversation SET active_task_id=? WHERE id=?", (task_id, conversation_id))
         return task_id
 
-    def new_task(self, inbound_id):
+    def new_task(self, inbound_id, executor=None):
         with self.db:
             row = self.inbound(inbound_id)
             self.db.execute("UPDATE task SET status='closed' WHERE id=(SELECT active_task_id FROM conversation WHERE id=?)", (row["conversation_id"],))
-            self._create_task(row["conversation_id"])
+            self._create_task(row["conversation_id"], executor)
+            self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+
+    def finish_command(self, inbound_id):
+        with self.db:
             self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
 
     def stored_result(self, turn_id):
@@ -173,7 +180,7 @@ class Storage:
                         text += data["text"]
                     deltas = False
                 elif kind == "error":
-                    error = str(data.get("message", "Executor error"))
+                    error = error or str(data.get("message", "Executor error"))
                 elif kind == "turn_completed":
                     completed = True
                     text = data.get("text") or text

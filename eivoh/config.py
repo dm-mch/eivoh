@@ -17,6 +17,10 @@ class Config:
     claude_bin: str = "claude"
     claude_args: tuple[str, ...] = ()
     stt_provider: str | None = None
+    default_executor: str = "claude"
+    codex_bin: str = "codex"
+    codex_model: str | None = None
+    codex_args: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -40,8 +44,19 @@ class Config:
         for arg in claude_args:
             if arg.split("=", 1)[0] in owned or arg.startswith("-p"):
                 raise ValueError("EIVOH_CLAUDE_ARGS contains an adapter-owned flag")
+        try:
+            codex_args = tuple(shlex.split(os.environ.get("EIVOH_CODEX_ARGS", "")))
+        except ValueError as exc:
+            raise ValueError("Invalid quoting in EIVOH_CODEX_ARGS") from exc
+        for arg in codex_args:
+            if arg in {"exec", "resume", "--json", "-C", "--cd"} or arg.startswith("--cd="):
+                raise ValueError("EIVOH_CODEX_ARGS contains an adapter-owned argument")
+        default_executor = os.environ.get("EIVOH_DEFAULT_EXECUTOR", "claude").strip().lower()
+        if default_executor not in {"claude", "codex"}:
+            raise ValueError("EIVOH_DEFAULT_EXECUTOR must be claude or codex")
         return cls(token, int(owner),
                    Path(os.environ.get("EIVOH_STATE_DIR", "~/.local/state/eivoh")).expanduser().resolve(),
                    workdir, os.environ.get("EIVOH_CLAUDE_MODEL") or None,
                    mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"), claude_args,
-                   provider_from_env(os.environ))
+                   provider_from_env(os.environ), default_executor,
+                   os.environ.get("EIVOH_CODEX_BIN", "codex"), os.environ.get("EIVOH_CODEX_MODEL") or None, codex_args)

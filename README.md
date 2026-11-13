@@ -60,6 +60,10 @@ EIVOH_WORKDIR=/home/your-user/src/eivoh
 # EIVOH_CLAUDE_PERMISSION_MODE=bypassPermissions
 # EIVOH_CLAUDE_BIN=claude
 # EIVOH_CLAUDE_ARGS=
+# EIVOH_DEFAULT_EXECUTOR=claude
+# EIVOH_CODEX_BIN=codex
+# EIVOH_CODEX_MODEL=
+# EIVOH_CODEX_ARGS=
 ```
 
 Set `EIVOH_WORKDIR` explicitly to the working tree the executor should edit,
@@ -83,6 +87,20 @@ export EIVOH_CLAUDE_ARGS="--settings '{\"enabledPlugins\":{\"example-plugin@exam
 ```
 
 For the systemd environment file, use the same quoted value without `export`.
+
+Codex is the second executor (installed `codex` CLI with ChatGPT login). A task
+uses the executor chosen when it was created: `/new codex` or `/new claude`; plain
+`/new` and the first task use `EIVOH_DEFAULT_EXECUTOR` (default `claude`). Each
+turn runs `codex exec --json --dangerously-bypass-approvals-and-sandbox -` (or
+`codex exec resume ... <thread_id> -`) in `EIVOH_WORKDIR`, with the prompt on
+stdin. The Codex sandbox is bypassed like Claude's default permission mode; on
+hosts that forbid unprivileged user namespaces its bubblewrap sandbox cannot
+start anyway. Inherited `OPENAI_*` and `CODEX_API_KEY` variables are removed so
+the subscription login is used. `EIVOH_CODEX_ARGS` (shlex-split, for example
+`-c model_reasoning_effort="high"`) is appended on start and resume; `exec`,
+`resume`, `--json` and `-C`/`--cd` are rejected. Codex sends whole messages, not
+text deltas, so its answer grows message by message; the final answer is its
+last message.
 
 Only the numeric owner in a private chat is admitted. Use one instance and a
 dedicated token; multi-instance locking belongs to V2.
@@ -158,8 +176,8 @@ units including markup. Other syntax remains readable text.
 
 The ordinary tests use no network or real Claude. The review-fix suite runs on
 Python 3.12.3 with PTB 22.8.
-To opt into a real Claude `haiku` turn, resume and Bash-sleep cancellation/orphan
-check through a fake channel (no Telegram):
+To opt into a real Claude `haiku` and Codex `gpt-6.1-sol` turn, resume and
+sleep-command cancellation/orphan check through a fake channel (no Telegram):
 
 ```sh
 EIVOH_LIVE=1 .venv/bin/pytest -q tests/test_live.py
