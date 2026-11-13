@@ -195,6 +195,7 @@ async def test_notice_flood_wait_does_not_hold_executor_slot(live_rig):
     await gateway.receive(inbound(1, 'held'))
     await ready(live_rig)
     await gateway.receive(inbound(2, 'CLARIFY'))
+    await until(lambda: (path / 'wire-input.jsonl').exists() and 'CLARIFY' in (path / 'wire-input.jsonl').read_text())
     (path / 'release').touch()
     await asyncio.wait_for(blocked.wait(), 5)
     await until(lambda: storage.turn_for(1)['status'] == 'completed')
