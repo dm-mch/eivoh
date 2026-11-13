@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fake codex for offline tests: emits the probed `codex exec --json` shapes.
 
-`exec [resume ID] ... -`: the prompt comes from stdin. A prompt containing
+`exec ... [resume ID] -`: the prompt comes from stdin. A prompt containing
 "sleep" starts a command in its own session, like codex, and waits for it.
 """
 import json
@@ -12,7 +12,7 @@ import uuid
 
 args = sys.argv[1:]
 assert args[0] == "exec" and args[-1] == "-", args
-resume = len(args) > 1 and args[1] == "resume"
+resume = len(args) > 2 and args[-3] == "resume"
 thread = args[-2] if resume else str(uuid.uuid4())
 prompt = sys.stdin.read()
 with open(os.environ["FAKE_CODEX_LOG"], "a") as log:

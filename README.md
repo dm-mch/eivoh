@@ -91,8 +91,8 @@ For the systemd environment file, use the same quoted value without `export`.
 Codex is the second executor (installed `codex` CLI with ChatGPT login). A task
 uses the executor chosen when it was created: `/new codex` or `/new claude`; plain
 `/new` and the first task use `EIVOH_DEFAULT_EXECUTOR` (default `claude`). Each
-turn runs `codex exec --json --dangerously-bypass-approvals-and-sandbox -` (or
-`codex exec resume ... <thread_id> -`) in `EIVOH_WORKDIR`, with the prompt on
+turn runs `codex exec --json --dangerously-bypass-approvals-and-sandbox ... -` (or
+`codex exec ... resume <thread_id> -`; all options precede `resume`) in `EIVOH_WORKDIR`, with the prompt on
 stdin. The Codex sandbox is bypassed like Claude's default permission mode; on
 hosts that forbid unprivileged user namespaces its bubblewrap sandbox cannot
 start anyway. Inherited `OPENAI_*` and `CODEX_API_KEY` variables are removed so

@@ -102,6 +102,10 @@ class CliExecutor:
         """Return a callable str -> Record; a new one for each turn."""
         raise NotImplementedError
 
+    def effective_model(self) -> str | None:
+        """The model this turn runs on, as far as Eivoh can tell."""
+        return self.model
+
     def start(self, run_id, prompt):
         return self._turn(run_id, prompt)
 
@@ -142,6 +146,10 @@ class CliExecutor:
             self.starting.pop(run_id, None)
         proc = tree.process
         queue = asyncio.Queue()
+        # Journal what ran: later calibration by executor and model needs it.
+        # The prompt goes to stdin, so argv holds no message content.
+        await queue.put(Record(None, {"executor": type(self).__name__, "model": self.effective_model(),
+                                      "argv": args, "cwd": str(self.workdir)}, stream="meta"))
 
         async def read(pipe, stream):
             def record(line):

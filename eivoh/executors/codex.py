@@ -15,6 +15,7 @@ workspace for both start and resume.
 import json
 import os
 from pathlib import Path
+import tomllib
 
 from .base import Event, Record
 from .cli import CliExecutor
@@ -83,17 +84,16 @@ class CodexExecutor(CliExecutor):
         super().__init__(workdir, binary, model, grace, extra_args)
 
     def command(self, session_id):
-        args = [self.binary, "exec"]
-        if session_id:
-            args.append("resume")
         # The bubblewrap sandbox cannot start on hosts that forbid unprivileged
         # user namespaces; Eivoh runs the executor like Claude's bypass mode.
-        args += ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
+        args = [self.binary, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
         if self.model:
             args += ["-m", self.model]
+        # All options precede `resume`: `exec resume` rejects some exec options
+        # (--add-dir, -p, --color), but accepts them before the subcommand.
         args += list(self.extra_args)
         if session_id:
-            args.append(session_id)
+            args += ["resume", session_id]
         return args + ["-"]  # Prompt from stdin.
 
     def environment(self):
@@ -102,3 +102,14 @@ class CodexExecutor(CliExecutor):
 
     def parser(self):
         return CodexParser()
+
+    def effective_model(self):
+        if self.model:
+            return self.model
+        # Without -m, codex uses the model from its own config.
+        path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
+        try:
+            model = tomllib.loads(path.read_text()).get("model")
+        except (OSError, tomllib.TOMLDecodeError):
+            return None
+        return f"{model} (codex config)" if model else None

@@ -45,12 +45,20 @@ def test_parser_failure_and_warnings():
     assert bad.events[0].kind == 'error'
 
 
+def test_effective_model(tmp_path, monkeypatch):
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path))
+    assert CodexExecutor(tmp_path, 'codex', model='m').effective_model() == 'm'
+    assert CodexExecutor(tmp_path, 'codex').effective_model() is None
+    (tmp_path / 'config.toml').write_text('model = "gpt-test"\n')
+    assert CodexExecutor(tmp_path, 'codex').effective_model() == 'gpt-test (codex config)'
+
+
 def test_command_and_environment(tmp_path, monkeypatch):
     executor = CodexExecutor(tmp_path, 'codex', model='gpt-x', extra_args=('-c', 'k="v"'))
     assert executor.command(None) == ['codex', 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox',
                                       '--skip-git-repo-check', '-m', 'gpt-x', '-c', 'k="v"', '-']
-    assert executor.command('abc')[:2] == ['codex', 'exec'] and executor.command('abc')[2] == 'resume'
-    assert executor.command('abc')[-2:] == ['abc', '-']
+    # Options stay before `resume`, so start-only exec options also work on resume.
+    assert executor.command('abc') == executor.command(None)[:-1] + ['resume', 'abc', '-']
     monkeypatch.setenv('OPENAI_API_KEY', 'secret')
     monkeypatch.setenv('CODEX_API_KEY', 'secret')
     env = executor.environment()
@@ -85,11 +93,15 @@ async def test_new_codex_task_runs_and_resumes(codex_rig):
     task = storage.db.execute('SELECT * FROM task WHERE id=?', (first['task_id'],)).fetchone()
     assert task['executor'] == 'codex' and task['session_id'] == first['session_id'] == second['session_id']
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    assert calls[0]['args'][1] != 'resume' and calls[1]['args'][1:2] == ['resume']
+    assert 'resume' not in calls[0]['args'] and calls[1]['args'][-3] == 'resume'
     assert calls[1]['args'][-2] == first['session_id'] and not any(c['openai'] for c in calls)
     final = channel.edits[-1][2] if channel.edits else channel.sent[-1][1]
     assert 'echo: again resumed=True' in final and 'Working on it' not in final
     assert storage.stored_result(second['id']) == ('echo: again resumed=True', None)
+    meta = storage.db.execute("SELECT stream, payload FROM raw_event WHERE turn_id=? ORDER BY sequence LIMIT 1", (second['id'],)).fetchone()
+    payload = json.loads(meta['payload'])
+    assert meta['stream'] == 'meta' and payload['executor'] == 'CodexExecutor'
+    assert payload['argv'][-2:] == [first['session_id'], '-'] and 'again' not in json.dumps(payload)
 
 
 async def test_codex_failure_is_reported(codex_rig):
