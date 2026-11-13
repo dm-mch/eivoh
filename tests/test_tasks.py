@@ -17,9 +17,11 @@ class HeldExecutor:
         self.calls = []
         self.releases = {}
         self.cancelled = []
+        self.efforts = {}
 
-    async def start(self, run_id, prompt, model=None, session_id=None):
+    async def start(self, run_id, prompt, model=None, session_id=None, effort=None):
         session_id = session_id or f'{self.name}-{run_id}'
+        self.efforts[run_id] = effort
         release = self.releases.setdefault(run_id, asyncio.Event())
         self.calls.append((run_id, prompt, model, session_id))
         yield Record(None, {}, (Event('session_started', {}, None, session_id),))
@@ -27,8 +29,8 @@ class HeldExecutor:
         await release.wait()
         yield Record(None, {}, (Event('turn_completed', {'status': 'completed', 'text': f'Answer {run_id}'}, None),))
 
-    def resume(self, run_id, session_id, prompt, model=None):
-        return self.start(run_id, prompt, model, session_id)
+    def resume(self, run_id, session_id, prompt, model=None, effort=None):
+        return self.start(run_id, prompt, model, session_id, effort=effort)
 
     async def cancel(self, run_id):
         self.cancelled.append(run_id)
@@ -213,7 +215,7 @@ async def test_task_list_pages_order_buttons_and_closed(held):
     await gateway.receive(inbound(19, '/tasks'))
     text = channel.sent[-1][1]
     assert 'page 1/3' in text and '10 more open' in text
-    assert len([line for line in text.splitlines() if 'claude/default' in line]) == 8
+    assert len([line for line in text.splitlines() if 'claude / default · default' in line]) == 8
     assert channel.buttons[-1] == [[(f'{i} · Title {i}', f'/task {i}')] for i in range(18, 10, -1)] + [[('Older ›', '/tasks 2')]]
     await gateway.receive(inbound(20, '/tasks 2'))
     assert channel.buttons[-1][-1] == [('‹ Newer', '/tasks 1'), ('Older ›', '/tasks 3')]
@@ -386,7 +388,7 @@ def test_migration_three_preserves_v2_sessions_turns_and_legacy_column(tmp_path)
         db.execute("INSERT INTO raw_event(turn_id,sequence,stream,payload,kinds,events,created_at) VALUES (2,1,'meta',?,'[]','[]','2099-01-01 00:00:00')", (payload,))
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
         assert dict(store.session(1, 'claude')) == {'task_id': 1, 'executor': 'claude', 'session_id': 'old-session', 'synced_inbound_id': 1}
         assert store.task(1, 1)['session_id'] == 'old-session'
         assert store.task(1, 1)['last_active'] == '2099-01-01 00:00:00'

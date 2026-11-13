@@ -75,7 +75,7 @@ class ClaudeExecutor(CliExecutor):
         super().__init__(workdir, binary, model, grace, extra_args)
         self.permission_mode = permission_mode
 
-    def command(self, session_id, model=None):
+    def command(self, session_id, model=None, effort=None):
         args = [self.binary, "-p", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages", "--permission-mode", self.permission_mode]
         if session_id:
@@ -83,7 +83,20 @@ class ClaudeExecutor(CliExecutor):
         model = model or self.model
         if model:
             args += ["--model", model]
-        return args + list(self.extra_args)
+        extra = list(self.extra_args)
+        if effort is not None:
+            # Remove both CLI spellings and duplicates so task settings always win.
+            filtered, index = [], 0
+            while index < len(extra):
+                arg = extra[index]
+                if arg == '--effort':
+                    index += 2
+                    continue
+                if not arg.startswith('--effort='):
+                    filtered.append(arg)
+                index += 1
+            extra = filtered + ['--effort', effort]
+        return args + extra
 
     def environment(self):
         # Inherited API keys would switch the CLI from the subscription to API billing.
@@ -101,10 +114,10 @@ class ClaudeStreamExecutor(InteractiveExecutor, ClaudeExecutor):
     # Claude echoes only after its current tool completes, which can take hours.
     # Lifecycle/stop ends the wait; a healthy long tool is not an ack timeout.
     ack_timeout = None
-    def command(self, session_id, model=None):
-        return super().command(session_id, model) + ['--input-format', 'stream-json', '--replay-user-messages']
+    def command(self, session_id, model=None, effort=None):
+        return super().command(session_id, model, effort) + ['--input-format', 'stream-json', '--replay-user-messages']
 
-    async def initialize(self, run, prompt, model):
+    async def initialize(self, run, prompt, model, effort=None):
         await run.write({'type': 'user', 'uuid': str(uuid.uuid4()),
                          'message': {'role': 'user', 'content': prompt}})
         run.ready.set()

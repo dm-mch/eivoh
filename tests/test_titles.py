@@ -19,7 +19,7 @@ class NameExecutor(HeldExecutor):
         self.outcome, self.held = outcome, held
         self.usage = []
 
-    async def start(self, run_id, prompt, model=None):
+    async def start(self, run_id, prompt, model=None, effort=None):
         self.calls.append((run_id, prompt, model))
         self.releases[run_id] = asyncio.Event()
         yield Record(None, {}, (Event('session_started', {}, None, 'isolated-title-session'),))

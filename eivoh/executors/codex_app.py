@@ -8,7 +8,7 @@ from .interactive import InteractiveExecutor
 
 
 class CodexAppExecutor(InteractiveExecutor, CodexExecutor):
-    def command(self, session_id, model=None):
+    def command(self, session_id, model=None, effort=None):
         return [self.binary, 'app-server', '--listen', 'stdio://', *self.extra_args]
 
     async def rpc(self, run, method, params):
@@ -24,7 +24,7 @@ class CodexAppExecutor(InteractiveExecutor, CodexExecutor):
             run.requests.pop(request_id, None)
             run.request_methods.pop(request_id, None)
 
-    async def initialize(self, run, prompt, model):
+    async def initialize(self, run, prompt, model, effort=None):
         await self.rpc(run, 'initialize', {'clientInfo': {'name': 'eivoh', 'version': '0.1.0'},
                                           'capabilities': {'experimentalApi': True}})
         await run.write({'method': 'initialized'})
@@ -36,7 +36,8 @@ class CodexAppExecutor(InteractiveExecutor, CodexExecutor):
         response = await self.rpc(run, 'thread/resume' if run.session_id else 'thread/start', params)
         run.session_id = response['thread']['id']
         response = await self.rpc(run, 'turn/start', {'threadId': run.session_id,
-            'input': [{'type': 'text', 'text': prompt}], **({'model': model or self.model} if model or self.model else {})})
+            'input': [{'type': 'text', 'text': prompt}], **({'model': model or self.model} if model or self.model else {}),
+            **({'effort': effort} if effort is not None else {})})
         run.turn_id = response['turn']['id']
         run.ready.set()
 

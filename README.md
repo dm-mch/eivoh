@@ -82,7 +82,9 @@ modes' headless behavior is unverified. Eivoh removes inherited `CLAUDE*` and
 (shell-style quoting, without shell expansion) and appended after all built-in
 Claude arguments on both start and resume. The adapter owns `--resume`,
 `-p`/`--print`, `--output-format`, `--input-format`, `--permission-mode` and `--model`;
-these flags are rejected here, including `--flag=value` forms.
+these flags are rejected here, including `--flag=value` forms. An explicit task
+effort overrides every configured `--effort`/`--effort=value` for that launch;
+`/effort default` leaves the configured effort in effect.
 Claude Code plugins enabled globally also load in the executor. To disable a
 plugin, pass a settings override, for example with this shell command:
 
@@ -94,7 +96,10 @@ For the systemd environment file, use the same quoted value without `export`.
 
 Codex is the second executor (installed `codex` CLI with ChatGPT login). A task
 initially uses the executor chosen by `/new codex` or `/new claude`; plain
-`/new` and the first task use `EIVOH_DEFAULT_EXECUTOR` (default `claude`). Each
+`/new` inherits the current task’s executor, model and effort. An explicit executor
+also inherits model and effort if it matches the current task’s executor; a
+different executor uses its defaults. With no current task, the default executor
+is `EIVOH_DEFAULT_EXECUTOR` (default `claude`). Each
 turn runs a local `codex app-server --listen stdio://` subprocess in
 `EIVOH_WORKDIR`. Eivoh starts or resumes its native thread, streams answer deltas,
 and injects clarifications through `turn/steer`. Existing threads created by
@@ -120,9 +125,14 @@ the combined answer retains the complete answer before it and the follow-up.
 Complete answer parts are journaled separately from partial streaming text, so a
 restart between parts preserves them in the displayed answer and later history.
 
-`/model` shows the active task's executor and selected model (`default` means
-the executor's configured default), followed by a numbered catalog grouped by
-executor. Use `/model <name or number>`, for example `/model claude-opus-5-5`
+`/model` shows the target task’s settings as `claude / opus · high` (or
+`· default` when no effort is selected), followed by a numbered catalog grouped by
+configured executor. `default` model means the executor’s configured default.
+Buttons open each executor’s model list and the effort menu. `/model <executor>`
+opens eight models per page; `/model <executor> page <N>` navigates and
+`/model <executor> <model>` selects within that executor. Each tap sends a new
+message. Model commands exceeding Telegram’s 64-byte callback limit are shown
+as numbered text choices. Use `/model <name or number>`, for example `/model claude-opus-5-5`
 or `/model astra`. Names match case-insensitively: an exact ID or alias takes
 priority over a unique substring; ambiguous and unknown names list candidates.
 Numbers refer to the last catalog shown in that chat; list again after a restart.
@@ -132,8 +142,34 @@ IDs or aliases. Codex's catalog is read on demand from
 `$CODEX_HOME/models_cache.json` (default `~/.codex/models_cache.json`), using only
 entries with `visibility: "list"`; an unreadable cache gives an empty list.
 
-Model selection is stored per task and applies immediately to turns that have not
-been claimed yet. A running or recovering turn keeps its recorded executor/model.
+`/effort` shows the current reasoning effort and buttons for supported levels plus
+`default`. `/effort <level>` selects one; `/effort default` clears the task override.
+Codex receives the override on each turn; without it, the executor/model default
+applies, including `model_reasoning_effort` in `EIVOH_CODEX_ARGS`. The isolated
+Codex title generator keeps its fixed low effort.
+Claude supports `low`, `medium`, `high`, `xhigh`, `max`. Codex levels come from the
+selected model’s `supported_reasoning_levels` in its local cache; the default model
+or a missing cache entry offers `low`, `medium`, `high`, `xhigh`. Unsupported values
+are refused. Changing model resets an incompatible effort to default and says so.
+Model/effort confirmations, new-task and switch replies include buttons to reopen
+both menus. Every settings button carries an explicit task target, for example
+`/model #12`, `/model #12 codex page 2`, `/model #12 codex gpt-6.1-sol`, or
+`/effort #12 high`. These forms also work as typed commands. The task must belong
+to the same conversation; unknown or foreign IDs are refused without falling back
+to the current task. This binding works even when Telegram posted a menu but its
+send acknowledgement and reply mapping were lost. Settings for a closed task can
+change without reopening it. Callback commands do not use the clicked message
+as a reply target; old settings buttons without an explicit target are refused.
+
+Menus opened without a task use `#new` (also accepted in typed commands). Browsing
+these menus creates nothing; selecting always creates a fresh task with executor
+defaults plus the selection, even if another task has become current meanwhile.
+A later tap on that original taskless menu creates another fresh task; redelivery
+of the same callback is still deduplicated. Model choices too long for a callback
+retain numbered text and an explicit command example, including the task target.
+
+Model and effort selection are stored per task and apply to turns that have not
+been claimed yet. A running or recovering turn keeps its recorded executor/model/effort.
 Each task keeps a native session separately for Claude and Codex: switching back
 resumes that executor's original session. Eivoh passes only the earlier turns
 that executor has missed since its last finished turn (the whole bounded history
@@ -144,14 +180,16 @@ of both user and assistant text with role labels and omission markers. This
 transfers conversation text, not native tool state. Turns without a stored final
 answer are marked as such. The switch reply reports the currently included turn
 count; zero is shown as “Context kept (same session)”. With no current task,
-model selection creates one.
+model or effort selection creates one.
 
 Chat commands:
 
 * `/new [claude|codex] [title…]` creates a task and makes it current. The previous
-  task stays open and keeps running. An unrecognized first word is part of the title.
+  task stays open and keeps running. Settings inherit as described above; an
+  unrecognized first word is part of the title. There is no model argument to
+  `/new`; use `/model` afterward so model names remain valid title text.
 * `/tasks [page]` lists open tasks, most recently active first, eight per page.
-  Each entry shows its number, title, executor/model, running/queued/idle state,
+  Each entry shows its number, title, executor/model/effort, running/queued/idle state,
   time since last activity and lifespan from creation to last activity (for example
   `over 3h`). Lifespan includes idle gaps; it is not accumulated executor runtime.
   Ages and lifespans use UTC, rounded down to minutes, hours or days; a lifespan
@@ -159,7 +197,8 @@ Chat commands:
   Buttons switch tasks or change pages; the list reports
   how many other open tasks exist. `/tasks all [page]` includes closed tasks.
 * `/task N` switches to task N, reopening it if closed, and shows short excerpts
-  of its last user message and stored answer. `/task` lists tasks.
+  of its last user message and stored answer, with its own stored executor/model/effort.
+  `/task` lists tasks.
 * `/stop [N]` cancels running and queued work for the target task, keeping it open.
   `/stop all` cancels work in every task of this conversation.
 * `/close [N]` stops and closes the target task. If it was current, the most recently
@@ -168,13 +207,15 @@ Chat commands:
   are preserved. Otherwise its first message supplies a temporary title: voice
   prefix removed, whitespace collapsed, shortened to 40 characters.
 * `/model [name or number]` shows or changes the target task's model as described above.
+* `/effort [level or default]` shows or changes the target task's reasoning effort.
 * `/q <text>` queues a message after the running turn and earlier queued messages.
 
-For `/stop`, `/close`, `/model` and `/title`, an explicit task number (where the
-syntax allows one) takes priority, then a replied-to task, then the current task.
-The number in `/model` selects a model, not a task. Unknown task numbers and tasks
+For `/stop`, `/close`, `/model`, `/effort` and `/title`, an explicit task number (where the
+syntax allows one) takes priority, then a replied-to task, then the current task
+for typed commands. `/model #N …` and `/effort #N …` explicitly target task N;
+a bare number in `/model` selects a model, not a task. Unknown task numbers and tasks
 from another conversation are refused. Tasks are never automatically closed.
-Telegram registers new, tasks, model, stop, q, close and title in its command menu;
+Telegram registers new, tasks, model, effort, stop, q, close and title in its command menu;
 inline button commands use the same validation and durable deduplication as typing.
 
 After a new task's first successful text answer, a background request generates
@@ -323,17 +364,17 @@ an ordinary message. Unknown reply targets fall
 back to the current task. With neither a known target nor a current task, a new
 current task is created. Reply routing itself does not switch the current task.
 Ordinary messages to a running task add clarifications to that run when its
-executor/model still matches the task's selection. The chat confirms only after
+executor/model/effort still matches the task's selection. The chat confirms only after
 the executor acknowledges the input before the reader sees the turn end; this
 confirms receipt, not completion of its instructions. A late acknowledgement stays
 uncertain and cannot attach the input to an already finished answer.
 Claude may acknowledge only after its current tool finishes. Acceptance is shown
 by a 👀 reaction on the owner's message; ordinary queueing uses ✍. Text notices
-remain for unconfirmed delivery and queueing due to a changed executor/model.
+remain for unconfirmed delivery and queueing due to a changed executor/model/effort.
 Channels without reactions stay silent; reactions are best effort and are not
 replayed after a restart. This reaction behaviour is unverified in live Telegram.
 `/q <text>` keeps a message for the next turn. Later messages cannot jump an
-earlier queued input, and messages after a model change use the next turn.
+earlier queued input, and messages after a model or effort change use the next turn.
 Messages arriving as a run ends safely stay queued. Commands themselves never
 steer. `/stop` remains the hard interrupt.
 
@@ -378,12 +419,14 @@ ID cannot be reconstructed. Restoring an older database does not by itself resto
 or remove files.
 Migration 7 adds numeric message-ID expression indexes to inbound and delivery
 rows for displacement lookups; journal contents and delivery identities stay
-unchanged.
+unchanged. Migration 8 adds nullable task and turn effort, preserving existing data
+and default behavior. Effort is fixed with the turn’s model at claim time and
+retained through recovery and accepted steering inputs.
 Older releases reject newer schema versions. A rollback needs a
 compatible release or a separately planned database restore.
 Conversations point to one current task among their open tasks; turns retain
 observed session IDs and raw events. Launch metadata separates
-the requested model and its source from a configured-model hint (Codex config)
+the requested model/effort and their sources from a configured-model hint (Codex config)
 and the observed model, which is unknown at launch. Claude's init and main assistant
 events retain model observations with their respective sources; an init report
 does not prove which model generated a response. Model IDs contain no source labels.
@@ -400,7 +443,7 @@ provides an additional containment layer. Interrupted turns remain recoverable.
 Restart recovery first applies journaled but unfinished commands in ID order,
 then starts per-task workers. It finalizes a stored result and delivers its answer
 without launching the executor again. Otherwise it uses the turn's recorded
-executor/model and that executor's task session, with the original request and a
+executor/model/effort and that executor's task session, with the original request and a
 reminder to check existing work when resuming. The assembled prompt, including
 any missed transcript, is journaled before launch and reused on recovery: a session
 ID alone does not acknowledge receipt of the first prompt. Legacy pending turns

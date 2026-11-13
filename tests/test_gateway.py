@@ -259,7 +259,7 @@ async def test_model_same_executor_applies_immediately_and_keeps_session(rig):
     assert calls[1]['resume'] == calls[0]['sid']
     assert [call['prompt'] for call in calls] == ['first', 'second']
     assert storage.turn_for(1) is storage.turn_for(3) is None
-    assert any('Model: claude / claude-sonnet-5-5. Context kept (same session).' == text
+    assert any(text.startswith('Model: claude / claude-sonnet-5-5 · default. Context kept (same session).')
                for _, text in channel.sent)
     assert storage.db.execute('SELECT COUNT(*) FROM turn').fetchone()[0] == 2
     assert storage.db.execute('SELECT COUNT(*) FROM task').fetchone()[0] == 1
@@ -268,7 +268,7 @@ async def test_model_same_executor_applies_immediately_and_keeps_session(rig):
     await gateway.idle()
     assert prompts(path)[-1]['resume'] is None
     assert prompts(path)[-1]['prompt'] == 'fresh'
-    assert storage.active_task(1)['model'] is None
+    assert storage.active_task(1)['model'] == 'claude-sonnet-5-5'
 
 
 async def test_model_listing_and_number_snapshot(rig, monkeypatch):
@@ -276,8 +276,8 @@ async def test_model_listing_and_number_snapshot(rig, monkeypatch):
     await gateway.receive(inbound(1, '/model'))
     await gateway.idle()
     text = channel.sent[-1][1]
-    assert text.startswith('Model: claude / default.')
-    assert 'claude:' in text and 'codex:' in text
+    assert text.startswith('Model: claude / default · default.')
+    assert 'claude:' in text and 'codex:' not in text
     assert '1. fable' in text and '6. claude-opus-5-5' in text
     assert storage.turn_for(1) is None and storage.active_task(1) is None
     monkeypatch.setenv('EIVOH_CLAUDE_MODELS', 'changed-model')
@@ -287,7 +287,7 @@ async def test_model_listing_and_number_snapshot(rig, monkeypatch):
     assert storage.db.execute('SELECT COUNT(*) FROM turn').fetchone()[0] == 0
     await gateway.receive(inbound(3, '/model'))
     await gateway.idle()
-    assert channel.sent[-1][1].startswith('Model: claude / claude-opus-5-5.')
+    assert channel.sent[-1][1].startswith('Model: claude / claude-opus-5-5 · default.')
     assert '1. changed-model' in channel.sent[-1][1]
 
 

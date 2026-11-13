@@ -32,12 +32,12 @@ class Immediate:
     def __init__(self, answer='answer'):
         self.calls = []
         self.answer = answer
-    async def start(self, run, prompt, model=None, session_id=None):
+    async def start(self, run, prompt, model=None, session_id=None, effort=None):
         self.calls.append((run, prompt, session_id))
         yield Record(None, {}, (Event('session_started', {}, None, session_id or f'session-{run}'),))
         yield Record(None, {}, (Event('turn_completed', {'status':'completed', 'text':self.answer}, None),))
-    def resume(self, run, session_id, prompt, model=None):
-        return self.start(run, prompt, model, session_id)
+    def resume(self, run, session_id, prompt, model=None, effort=None):
+        return self.start(run, prompt, model, session_id, effort=effort)
     async def cancel(self, run):
         pass
     async def shutdown(self):

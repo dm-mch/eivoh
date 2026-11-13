@@ -112,6 +112,7 @@ class TelegramChannel:
                 ("new", "Start a new task"),
                 ("tasks", "List and switch tasks"),
                 ("model", "Show or change the task model"),
+                ("effort", "Show or change reasoning effort"),
                 ("stop", "Stop running and queued work"),
                 ("q", "Queue a message after the running turn"),
                 ("close", "Close a task"),
@@ -167,7 +168,7 @@ class TelegramChannel:
                         await callback.answer()
                     except TelegramError:
                         log.warning("Could not acknowledge Telegram callback")
-                    if isinstance(callback.data, str):
+                    if isinstance(callback.data, str) and 0 < len(callback.data.encode("utf-8")) <= 64:
                         accepted = await receive(Inbound("telegram", str(chat.id), str(user.id),
                                               f"cb:{callback.id}", callback.data, button=True, update_id=update.update_id))
                         if accepted is False:

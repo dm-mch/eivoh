@@ -96,7 +96,7 @@ class CliExecutor:
         self.running: dict[int, ProcessTree] = {}
         self.starting: dict[int, asyncio.Task] = {}
 
-    def command(self, session_id: str | None, model=None) -> list[str]:
+    def command(self, session_id: str | None, model=None, effort=None) -> list[str]:
         raise NotImplementedError
 
     def environment(self) -> dict[str, str]:
@@ -106,25 +106,26 @@ class CliExecutor:
         """Return a callable str -> Record; a new one for each turn."""
         raise NotImplementedError
 
-    def model_metadata(self, model=None):
+    def model_metadata(self, model=None, effort=None):
         """Launch settings are requests, not evidence of the model used."""
         return {"requested_model": model or self.model,
                 "requested_model_source": "turn" if model else "executor_config" if self.model else None,
+                "requested_effort": effort, "requested_effort_source": "turn" if effort else None,
                 "configured_model": None, "configured_model_source": None,
                 "observed_model": None}
 
-    def start(self, run_id, prompt, model=None):
-        return self._turn(run_id, prompt, model=model)
+    def start(self, run_id, prompt, model=None, effort=None):
+        return self._turn(run_id, prompt, model=model, effort=effort)
 
-    def resume(self, run_id, session_id, prompt, model=None):
+    def resume(self, run_id, session_id, prompt, model=None, effort=None):
         if not SESSION_ID.fullmatch(session_id):
             raise ValueError("Invalid executor session id")
-        return self._turn(run_id, prompt, session_id, model)
+        return self._turn(run_id, prompt, session_id, model, effort)
 
-    async def _turn(self, run_id, prompt, session_id=None, model=None):
+    async def _turn(self, run_id, prompt, session_id=None, model=None, effort=None):
         if run_id in self.running or run_id in self.starting:
             raise RuntimeError("Run already running")
-        args = self.command(session_id, model)
+        args = self.command(session_id, model, effort)
         env = self.environment()
         parse_line = self.parser()
         async def spawn():
@@ -155,7 +156,7 @@ class CliExecutor:
         queue = asyncio.Queue()
         # Journal launch settings; observed model IDs belong to executor events.
         # The prompt goes to stdin, so argv holds no message content.
-        await queue.put(Record(None, {"executor": type(self).__name__, **self.model_metadata(model),
+        await queue.put(Record(None, {"executor": type(self).__name__, **self.model_metadata(model, effort),
                                       "argv": args, "cwd": str(self.workdir)}, stream="meta"))
 
         async def read(pipe, stream):

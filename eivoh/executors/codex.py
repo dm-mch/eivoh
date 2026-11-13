@@ -83,7 +83,7 @@ class CodexExecutor(CliExecutor):
     def __init__(self, workdir: Path, binary="codex", model=None, grace=0.5, extra_args=()):
         super().__init__(workdir, binary, model, grace, extra_args)
 
-    def command(self, session_id, model=None):
+    def command(self, session_id, model=None, effort=None):
         # The bubblewrap sandbox cannot start on hosts that forbid unprivileged
         # user namespaces; Eivoh runs the executor like Claude's bypass mode.
         args = [self.binary, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
@@ -104,8 +104,8 @@ class CodexExecutor(CliExecutor):
     def parser(self):
         return CodexParser()
 
-    def model_metadata(self, model=None):
-        metadata = super().model_metadata(model)
+    def model_metadata(self, model=None, effort=None):
+        metadata = super().model_metadata(model, effort)
         if metadata['requested_model']:
             return metadata
         # A config hint only: profiles/CLI overrides may change the actual model.
