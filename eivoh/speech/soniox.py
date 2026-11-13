@@ -1,4 +1,4 @@
-"""Speech to text through the Soniox async API (stdlib only).
+"""Soniox speech-to-text provider through its async API (stdlib only).
 
 Measured on 2026-11-13 with Telegram voice notes of 15-93 s: the async API
 returned in 3-6 s, while streaming the same file over the real-time WebSocket
@@ -12,12 +12,10 @@ import urllib.error
 import urllib.request
 import uuid
 
+from . import TranscriptionError
+
 log = logging.getLogger(__name__)
 BASE = "https://api.soniox.com"
-
-
-class TranscriptionError(Exception):
-    pass
 
 
 class SonioxTranscriber:

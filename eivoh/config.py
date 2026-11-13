@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import shlex
 
+from .speech import provider_from_env
+
 
 @dataclass(frozen=True)
 class Config:
@@ -14,7 +16,7 @@ class Config:
     permission_mode: str = "bypassPermissions"
     claude_bin: str = "claude"
     claude_args: tuple[str, ...] = ()
-    soniox_api_key: str | None = None
+    stt_provider: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -42,4 +44,4 @@ class Config:
                    Path(os.environ.get("EIVOH_STATE_DIR", "~/.local/state/eivoh")).expanduser().resolve(),
                    workdir, os.environ.get("EIVOH_CLAUDE_MODEL") or None,
                    mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"), claude_args,
-                   os.environ.get("SONIOX_API_KEY", "").strip() or None)
+                   provider_from_env(os.environ))

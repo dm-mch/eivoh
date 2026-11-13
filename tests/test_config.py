@@ -4,7 +4,7 @@ from eivoh.config import Config
 
 
 def test_config(monkeypatch, tmp_path):
-    for key in ('EIVOH_STATE_DIR', 'EIVOH_WORKDIR', 'EIVOH_CLAUDE_MODEL', 'EIVOH_CLAUDE_PERMISSION_MODE', 'EIVOH_CLAUDE_BIN', 'EIVOH_CLAUDE_ARGS'):
+    for key in ('EIVOH_STT', 'SONIOX_API_KEY', 'EIVOH_STATE_DIR', 'EIVOH_WORKDIR', 'EIVOH_CLAUDE_MODEL', 'EIVOH_CLAUDE_PERMISSION_MODE', 'EIVOH_CLAUDE_BIN', 'EIVOH_CLAUDE_ARGS'):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
     monkeypatch.setenv('EIVOH_OWNER_ID', '123')
@@ -68,3 +68,16 @@ def test_claude_args_invalid_quoting(monkeypatch, tmp_path):
     monkeypatch.setenv('EIVOH_CLAUDE_ARGS', "--settings 'unclosed")
     with pytest.raises(ValueError, match='Invalid quoting in EIVOH_CLAUDE_ARGS'):
         Config.from_env()
+
+
+def test_speech_provider_selection():
+    from eivoh.speech import make_transcriber, provider_from_env
+    assert provider_from_env({}) is None
+    assert provider_from_env({'SONIOX_API_KEY': 'k'}) == 'soniox'
+    assert provider_from_env({'SONIOX_API_KEY': 'k', 'EIVOH_STT': 'none'}) is None
+    with pytest.raises(ValueError, match='requires SONIOX_API_KEY'):
+        provider_from_env({'EIVOH_STT': 'soniox'})
+    with pytest.raises(ValueError, match='Unknown EIVOH_STT'):
+        provider_from_env({'EIVOH_STT': 'whisper'})
+    assert make_transcriber(None, {}) is None
+    assert type(make_transcriber('soniox', {'SONIOX_API_KEY': 'k'})).__name__ == 'SonioxTranscriber'

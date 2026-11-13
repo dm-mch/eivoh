@@ -7,7 +7,7 @@ from .channels.telegram import TelegramChannel
 from .config import Config
 from .executors.claude import ClaudeExecutor
 from .gateway import Gateway
-from .speech import SonioxTranscriber
+from .speech import make_transcriber
 from .storage import Storage
 
 
@@ -16,7 +16,7 @@ async def serve(config: Config):
     storage = Storage(config.state_dir / "eivoh.sqlite3")
     executor = ClaudeExecutor(config.workdir, config.claude_bin, config.claude_model,
                               config.permission_mode, extra_args=config.claude_args)
-    transcriber = SonioxTranscriber(config.soniox_api_key) if config.soniox_api_key else None
+    transcriber = make_transcriber(config.stt_provider, os.environ)
     channel = TelegramChannel(config.telegram_token, config.owner_id, transcriber=transcriber)
     gateway = Gateway(storage, executor, {"telegram": channel})
     stopping = asyncio.Event()

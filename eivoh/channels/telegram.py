@@ -66,7 +66,7 @@ class TelegramChannel:
 
     async def _transcribe(self, chat, media):
         if self.transcriber is None:
-            await self._request(chat, self.bot.send_message, text="Voice messages are not configured (no SONIOX_API_KEY).")
+            await self._request(chat, self.bot.send_message, text="Voice messages are not configured (set EIVOH_STT).")
             return None
         await self.typing(chat)
         try:
