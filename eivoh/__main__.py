@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import signal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .channels.telegram import TelegramChannel
 from .config import Config
@@ -10,6 +12,7 @@ from .executors.codex import CodexExecutor
 from .gateway import Gateway
 from .speech import make_transcriber
 from .storage import Storage
+from .titles import ClaudeTitleExecutor, CodexTitleExecutor
 
 
 async def serve(config: Config):
@@ -24,7 +27,14 @@ async def serve(config: Config):
     executor = executors.pop(config.default_executor)
     transcriber = make_transcriber(config.stt_provider, os.environ)
     channel = TelegramChannel(config.telegram_token, config.owner_id, transcriber=transcriber)
-    gateway = Gateway(storage, executor, {"telegram": channel}, executors=executors)
+    # An empty working directory prevents task/repository instructions from
+    # becoming naming instructions. Auth remains with each CLI's subscription.
+    title_directory = TemporaryDirectory(prefix='eivoh-titles-')
+    title_workdir = Path(title_directory.name)
+    title_executors = {'claude': ClaudeTitleExecutor(title_workdir, config.claude_bin),
+                       'codex': CodexTitleExecutor(title_workdir, config.codex_bin)}
+    gateway = Gateway(storage, executor, {"telegram": channel}, executors=executors,
+                      max_parallel=config.max_parallel, title_executors=title_executors)
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     def stop_requested():
@@ -51,6 +61,7 @@ async def serve(config: Config):
                 await gateway.shutdown()
     finally:
         await gateway.shutdown()
+        title_directory.cleanup()
         storage.close()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(sig)

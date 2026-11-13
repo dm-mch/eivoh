@@ -21,6 +21,7 @@ class Config:
     codex_bin: str = "codex"
     codex_model: str | None = None
     codex_args: tuple[str, ...] = ()
+    max_parallel: int = 3
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -54,9 +55,12 @@ class Config:
         default_executor = os.environ.get("EIVOH_DEFAULT_EXECUTOR", "claude").strip().lower()
         if default_executor not in {"claude", "codex"}:
             raise ValueError("EIVOH_DEFAULT_EXECUTOR must be claude or codex")
+        parallel = os.environ.get("EIVOH_MAX_PARALLEL", "3").strip()
+        if not parallel.isdecimal() or int(parallel) < 1:
+            raise ValueError("EIVOH_MAX_PARALLEL must be an integer >= 1")
         return cls(token, int(owner),
                    Path(os.environ.get("EIVOH_STATE_DIR", "~/.local/state/eivoh")).expanduser().resolve(),
                    workdir, os.environ.get("EIVOH_CLAUDE_MODEL") or None,
                    mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"), claude_args,
                    provider_from_env(os.environ), default_executor,
-                   os.environ.get("EIVOH_CODEX_BIN", "codex"), os.environ.get("EIVOH_CODEX_MODEL") or None, codex_args)
+                   os.environ.get("EIVOH_CODEX_BIN", "codex"), os.environ.get("EIVOH_CODEX_MODEL") or None, codex_args, int(parallel))

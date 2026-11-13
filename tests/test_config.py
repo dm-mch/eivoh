@@ -104,3 +104,19 @@ def test_codex_config(monkeypatch, tmp_path):
     monkeypatch.setenv('EIVOH_DEFAULT_EXECUTOR', 'gemini')
     with pytest.raises(ValueError, match='EIVOH_DEFAULT_EXECUTOR'):
         Config.from_env()
+
+
+@pytest.mark.parametrize('value,expected', [(None, 3), ('1', 1), ('8', 8), ('0', None), ('-1', None), ('1.5', None), ('many', None), ('', None)])
+def test_parallel_config(monkeypatch, tmp_path, value, expected):
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
+    if value is None:
+        monkeypatch.delenv('EIVOH_MAX_PARALLEL', raising=False)
+    else:
+        monkeypatch.setenv('EIVOH_MAX_PARALLEL', value)
+    if expected is None:
+        with pytest.raises(ValueError, match='EIVOH_MAX_PARALLEL'):
+            Config.from_env()
+    else:
+        assert Config.from_env().max_parallel == expected

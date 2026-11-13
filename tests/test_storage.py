@@ -57,7 +57,6 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
         first = store.journal(inbound(1, 'first'))
         second = store.journal(inbound(2, 'second'))
         new = store.journal(inbound(3, '/new'))
-        third = store.journal(inbound(4, 'third'))
         one, _ = store.claim(first['id'], 3)
         store.append(one['id'], parse_line('{"type":"system","subtype":"init","session_id":"old-session"}\n'))
         store.finish(one['id'], 'completed')
@@ -66,11 +65,12 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
         assert two['resume_id'] == 'old-session'
         store.finish(two['id'], 'completed')
         store.new_task(new['id'])
+        third = store.journal(inbound(4, 'third'))
         three, _ = store.claim(third['id'], 3)
         assert three['task_id'] != one['task_id'] and three['resume_id'] is None
         tasks = store.db.execute('SELECT * FROM task ORDER BY id').fetchall()
         assert [(t['executor'], t['session_id'], t['status']) for t in tasks] == [
-            ('claude', 'old-session', 'closed'), ('claude', None, 'active')]
+            ('claude', None, 'active'), ('claude', None, 'active')]
         assert store.db.execute('SELECT active_task_id FROM conversation').fetchone()[0] == three['task_id']
         assert store.db.execute('SELECT turn_id FROM raw_event').fetchone()[0] == one['id']
         assert not store.db.execute('PRAGMA foreign_key_check').fetchall()
@@ -81,7 +81,7 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
 def test_schema_version_reopen_and_future_rejected(tmp_path):
     path = tmp_path / 'version.db'
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 2
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 4
     store.journal(inbound(1, 'retained'))
     store.close()
     store = Storage(path)
@@ -141,7 +141,7 @@ def test_v1_upgrades_in_place(tmp_path):
                    "VALUES (1,1,1,1,'running','old-session')")
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 4
         task = store.active_task(1)
         assert task['model'] is None and task['session_id'] == 'old-session'
         turn, recovering = store.claim(1, 3)
@@ -176,7 +176,7 @@ def test_transcript_keeps_newest_whole_turns_and_final_answers(tmp_path):
         store.close()
 
 
-def test_recovery_routes_to_current_task_model_and_executor(tmp_path):
+def test_recovery_keeps_recorded_model_and_executor(tmp_path):
     store = Storage(tmp_path / 'routing.db')
     try:
         row = store.journal(inbound(1, 'interrupted'))
@@ -187,8 +187,8 @@ def test_recovery_routes_to_current_task_model_and_executor(tmp_path):
         recovered, recovering = store.claim(row['id'], 3)
         assert recovering
         assert recovered['session_id'] == 'old-session'  # Historical evidence only.
-        assert recovered['resume_id'] is None
-        assert (recovered['executor'], recovered['model']) == ('codex', 'gpt-6-astra')
+        assert recovered['resume_id'] == 'old-session'
+        assert (recovered['executor'], recovered['model']) == ('claude', None)
     finally:
         store.close()
 

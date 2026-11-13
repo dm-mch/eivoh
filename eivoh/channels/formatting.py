@@ -48,6 +48,8 @@ def markdown_to_html(text: str) -> str:
             continue
         if code is not None:
             code.append(line)
+        elif re.match(r'^#t\d+ ', line):
+            out.append(html.escape(line))  # Task labels/titles are literal display text.
         else:
             heading = re.match(r"^#{1,6} (.*?)(\n?)$", line)
             out.append(f"<b>{_inline(heading[1])}</b>{heading[2]}" if heading else _inline(line))

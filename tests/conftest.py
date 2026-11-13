@@ -15,10 +15,12 @@ class FakeChannel:
         self.sent = []
         self.edits = []
         self.typings = []
+        self.buttons = []
 
-    async def send(self, chat_id, text):
+    async def send(self, chat_id, text, buttons=None):
         self.sent.append((chat_id, text))
-        return str(len(self.sent))
+        self.buttons.append(buttons)
+        return 'bot:' + str(len(self.sent))
 
     async def edit(self, chat_id, message_id, text):
         self.edits.append((chat_id, message_id, text))
@@ -27,8 +29,8 @@ class FakeChannel:
         self.typings.append(chat_id)
 
 
-def inbound(mid, text, chat="10"):
-    return Inbound("fake", chat, "1", str(mid), text)
+def inbound(mid, text, chat="10", reply_to=None):
+    return Inbound("fake", chat, "1", str(mid), text, reply_to, button=str(mid).startswith("cb:"))
 
 
 async def until(predicate, timeout=5):
