@@ -138,9 +138,12 @@ Chat commands:
 * `/new [claude|codex] [title…]` creates a task and makes it current. The previous
   task stays open and keeps running. An unrecognized first word is part of the title.
 * `/tasks [page]` lists open tasks, most recently active first, eight per page.
-  Each entry shows its number, title, executor/model, running/queued/idle state
-  time since activity and, compactly, how long the task has been worked on
-  (creation to last activity, for example `over 3h`). Buttons switch tasks or change pages; the list reports
+  Each entry shows its number, title, executor/model, running/queued/idle state,
+  time since last activity and lifespan from creation to last activity (for example
+  `over 3h`). Lifespan includes idle gaps; it is not accumulated executor runtime.
+  Ages and lifespans use UTC, rounded down to minutes, hours or days; a lifespan
+  under one minute is omitted. Activity means a message, task switch or turn ending.
+  Buttons switch tasks or change pages; the list reports
   how many other open tasks exist. `/tasks all [page]` includes closed tasks.
 * `/task N` switches to task N, reopening it if closed, and shows short excerpts
   of its last user message and stored answer. `/task` lists tasks.
@@ -148,8 +151,9 @@ Chat commands:
   `/stop all` cancels work in every task of this conversation.
 * `/close [N]` stops and closes the target task. If it was current, the most recently
   active open task becomes current, or none if there are no open tasks.
-* `/title <text>` renames the target task. Otherwise its first message supplies a
-  title: voice prefix removed, whitespace collapsed, shortened to 40 characters.
+* `/title <text>` renames the target task. Explicit names from `/new` and `/title`
+  are preserved. Otherwise its first message supplies a temporary title: voice
+  prefix removed, whitespace collapsed, shortened to 40 characters.
 * `/model [name or number]` shows or changes the target task's model as described above.
 
 For `/stop`, `/close`, `/model` and `/title`, an explicit task number (where the
@@ -158,6 +162,29 @@ The number in `/model` selects a model, not a task. Unknown task numbers and tas
 from another conversation are refused. Tasks are never automatically closed.
 Telegram registers new, tasks, model, stop, close and title in its command menu;
 inline button commands use the same validation and durable deduplication as typing.
+
+After a new task's first successful text answer, a background request generates
+a 3–6 word title in the first message's language. It uses that first user message
+(up to 4,000 characters) and the beginning of the final answer (up to 2,000).
+Claude turns use `haiku`; Codex turns use `gpt-6-luna`, independent of the task's
+selected model. The answer is delivered without waiting for naming. A concurrent
+`/title` always wins. Naming shares the executor concurrency limit and has a
+30-second deadline including its slot wait. It is cancelled by `/stop`, `/close`
+and shutdown. Failed, invalid, timed-out or interrupted attempts keep the temporary
+title and are not automatically retried, including after reopening or restarting.
+Existing tasks retain their titles when upgrading.
+
+Naming uses separate ephemeral CLI sessions in an empty temporary directory,
+with tools and integrations disabled, and never resumes or changes task sessions.
+The outcome and requested naming model are journaled as metadata on the successful
+turn, with distinct `title_executor` and `title_model` fields. The last reported
+usage snapshot is retained as `title_usage` if the CLI supplies one, including on
+failure or cancellation; absent usage stays unknown. Reported provider cost does
+not establish subscription spend. Title output does not enter the turn's answer,
+transcript or ordinary executor events.
+The CLI flags were checked on Claude Code 2.1.323 and codex-cli 0.167.2; unsupported
+flags in other versions cause a quiet fallback to the temporary title.
+
 Answers and task-specific notices get a `#tN Title` label when more than one task
 is open or the answer belongs to a task other than the current one. Labels are
 for display only and are excluded from stored results and transcripts.
@@ -230,8 +257,10 @@ for reply routing. It backfills activity, launch settings and one session for ea
 executor a task has used, where derivable. Version 2 bound queued messages to a
 task only at dispatch, so upgrade when no `/new` is waiting in the queue: a message
 queued behind it would stay in the earlier task. The old task session column is
-retained but no longer read or updated. This does not make the previous release
-compatible: its schema-version guard rejects version 3. A rollback needs a
+retained but no longer read or updated.
+Migration 4 adds title provenance and a durable one-attempt marker. Because old
+titles lack provenance, all existing tasks are treated as manually named.
+Older releases reject newer schema versions. A rollback needs a
 compatible release or a separately planned database restore.
 Conversations point to one current task among their open tasks; turns retain
 observed session IDs and raw events. Launch metadata separates

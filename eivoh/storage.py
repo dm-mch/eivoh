@@ -84,6 +84,13 @@ MIGRATIONS = (
         "CREATE INDEX turn_task_queue ON turn(task_id,status,inbound_id)",
         "CREATE INDEX task_recent ON task(conversation_id,status,last_active DESC,id DESC)",
     ),
+    (
+        "ALTER TABLE task ADD COLUMN title_source TEXT NOT NULL DEFAULT 'fallback'",
+        "ALTER TABLE task ADD COLUMN title_attempted INTEGER NOT NULL DEFAULT 0",
+        # Old titles have no provenance: even a first-message-looking title may
+        # have been explicitly chosen. Preserve all existing tasks conservatively.
+        "UPDATE task SET title_source='manual'",
+    ),
 )
 
 
@@ -219,8 +226,9 @@ class Storage:
                             ("cancelled" if status == "cancelled" else "done", turn_id))
 
     def _create_task(self, conversation_id, executor=None, model=None, title=None):
-        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model,title,last_active) VALUES (?,?,?,?,?)",
-                                  (conversation_id, executor or self.default_executor, model, title, now())).lastrowid
+        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model,title,last_active,title_source) VALUES (?,?,?,?,?,?)",
+                                  (conversation_id, executor or self.default_executor, model, title, now(),
+                                   'manual' if title is not None else 'fallback')).lastrowid
         self.db.execute("UPDATE conversation SET active_task_id=? WHERE id=?", (task_id, conversation_id))
         return task_id
 
@@ -283,8 +291,58 @@ class Storage:
 
     def title_task(self, inbound_id, task_id, title):
         with self.db:
-            self.db.execute("UPDATE task SET title=? WHERE id=?", (title, task_id))
+            self.db.execute("UPDATE task SET title=?,title_source='manual' WHERE id=?", (title, task_id))
             self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+
+    def title_candidates(self):
+        return self.db.execute("SELECT id FROM task WHERE title_source='fallback' AND title_attempted=0 "
+                               "AND status='active' AND EXISTS (SELECT 1 FROM turn "
+                               "WHERE task_id=task.id AND status='completed')").fetchall()
+
+    def claim_title(self, task_id, models):
+        """One durable attempt, using the first successful turn's executor/result."""
+        with self.db:
+            eligible = self.db.execute("SELECT 1 FROM task WHERE id=? AND title_source='fallback' "
+                                       "AND title_attempted=0 AND status='active'", (task_id,)).fetchone()
+            if not eligible or not models:
+                return None
+            for turn in self.db.execute("SELECT * FROM turn WHERE task_id=? AND status='completed' ORDER BY inbound_id",
+                                        (task_id,)):
+                result = self.stored_result(turn['id'])
+                if result is not None and not result[1] and result[0].strip():
+                    break
+            else:
+                return None
+            if turn['executor'] not in models:
+                return None
+            changed = self.db.execute("UPDATE task SET title_attempted=1 WHERE id=? AND title_source='fallback' "
+                                      "AND title_attempted=0 AND status='active'", (task_id,)).rowcount
+            if not changed:
+                return None
+            first = self.db.execute("SELECT inbound.id,inbound.text FROM inbound JOIN turn ON turn.inbound_id=inbound.id "
+                                    "WHERE turn.task_id=? ORDER BY inbound.id LIMIT 1", (task_id,)).fetchone()
+            request = dict(task_id=task_id, turn_id=turn['id'], executor=turn['executor'],
+                           model=models[turn['executor']], first_inbound_id=first['id'])
+            self.title_event(request, 'started')
+        return {**request, 'user': first['text'], 'answer': result[0]}
+
+    def title_event(self, request, outcome, title=None):
+        """Metadata only: never replay title output as conversational events."""
+        payload = {key: request[key] for key in ('task_id', 'turn_id', 'first_inbound_id')}
+        payload.update(type='task_title', outcome=outcome, title_executor=request['executor'],
+                       title_model=request['model'])
+        if 'title_usage' in request:
+            payload['title_usage'] = request['title_usage']
+        if title is not None:
+            payload['title'] = title
+        self.append(request['turn_id'], Record(None, payload, stream='meta'))
+
+    def generated_title(self, request, title):
+        with self.db:
+            changed = self.db.execute("UPDATE task SET title=?,title_source='generated' WHERE id=? "
+                                      "AND title_source='fallback' AND status='active'",
+                                      (title, request['task_id'])).rowcount
+            self.title_event(request, 'generated' if changed else 'superseded', title if changed else None)
 
     def set_model(self, inbound_id, executor, model, task_id=None):
         with self.db:

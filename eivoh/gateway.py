@@ -8,6 +8,7 @@ from .channels.base import Channel, Inbound
 from .executors.base import Executor
 from .models import catalog, resolve
 from .storage import Storage, command
+from . import titles
 
 log = logging.getLogger(__name__)
 RESTART_PROMPT = "The service restarted; continue the interrupted task. Check existing work before repeating actions."
@@ -79,7 +80,8 @@ class Reply:
 
 class Gateway:
     def __init__(self, storage: Storage, executor: Executor, channels: dict[str, Channel],
-                 edit_interval=1.5, typing_interval=4, max_recoveries=3, executors=None, max_parallel=3):
+                 edit_interval=1.5, typing_interval=4, max_recoveries=3, executors=None, max_parallel=3,
+                 title_executors=None, title_timeout=30):
         # `executor` is the default one; `executors` adds named alternatives.
         self.default_executor = storage.default_executor
         self.executors = {**(executors or {}), self.default_executor: executor}
@@ -89,6 +91,10 @@ class Gateway:
         if not isinstance(max_parallel, int) or max_parallel < 1:
             raise ValueError("max_parallel must be an integer >= 1")
         self.slots = asyncio.Semaphore(max_parallel)
+        # Optional injection keeps fake/embedding executors entirely offline.
+        self.title_executors = title_executors or {}
+        self.title_timeout = title_timeout
+        self.title_jobs = {}
         self.replies = set()
         self.workers = {}
         self.locks = {}
@@ -102,6 +108,8 @@ class Gateway:
                 await self._command(row)
         for row in self.storage.pending():
             self._kick(self.storage.turn_for(row['id'])['task_id'])
+        for task in self.storage.title_candidates():
+            self._name_task(task['id'])
 
     async def receive(self, message: Inbound):
         if self.closing:
@@ -290,7 +298,7 @@ class Gateway:
         task_id = task['id'] if task else None
         active, queued = self.storage.stop(row['id'], task_id, close)
         targets = [task_id] if task else [t['id'] for t in self.storage.tasks(row['conversation_id'], True)]
-        jobs = [self.workers[t] for t in targets if t in self.workers]
+        jobs = [jobs[t] for t in targets for jobs in (self.workers, self.title_jobs) if t in jobs]
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
@@ -325,6 +333,8 @@ class Gateway:
                     text, error = result
                     self.storage.finish(pending_turn['id'], 'failed' if error else 'completed', error)
                     release()
+                    if not error:
+                        self._name_task(task_id)
                     reply = self._reply(row, task_id, pending_turn['id'])
                     reply.update((text + f"\n\nTask failed: {error}" if error else text) or 'Task completed without a text answer.')
                     try:
@@ -447,6 +457,8 @@ class Gateway:
                 error = "Executor ended without a completed turn"
             self.storage.finish(turn["id"], "failed" if error else "completed", error)
             release()
+            if not error:
+                self._name_task(turn['task_id'])
             if error:
                 text += f"\n\nTask failed: {error}"
             reply.update(text or "Task completed without a text answer.")
@@ -467,6 +479,53 @@ class Gateway:
             self.replies.discard(reply)
             await self._cancel_run(turn["id"])
 
+    def _name_task(self, task_id):
+        if self.closing or task_id in self.title_jobs:
+            return
+        models = {name: titles.MODELS[name] for name in self.title_executors if name in titles.MODELS}
+        request = self.storage.claim_title(task_id, models)
+        if request is None:
+            return
+        job = asyncio.create_task(self._generate_title(request))
+        self.title_jobs[task_id] = job
+        def forget(done):
+            self.title_jobs.pop(task_id, None)
+            if done.cancelled():
+                # Also covers cancellation before the coroutine's first step.
+                self.storage.title_event(request, 'cancelled')
+            elif done.exception():
+                log.error('Task %s title bookkeeping failed', task_id)
+        job.add_done_callback(forget)
+
+    async def _generate_title(self, request):
+        executor = self.title_executors[request['executor']]
+        run_id = -request['task_id']  # Disjoint from normal turn ids, even in fakes.
+        def observe_usage(data):
+            # Retain the last reported snapshot, including on later cancellation.
+            # Do not add repeated totals or infer unknown subscription consumption.
+            request['title_usage'] = data
+        try:
+            # Includes slot wait: background work cannot build an unbounded queue
+            # or monopolize the executor budget during a provider outage.
+            async with asyncio.timeout(self.title_timeout):
+                async with self.slots:
+                    try:
+                        title = await titles.generate(executor, run_id, request, observe_usage)
+                    finally:
+                        await executor.cancel(run_id)
+            if title:
+                self.storage.generated_title(request, title)
+            else:
+                self.storage.title_event(request, 'invalid_or_failed')
+        except TimeoutError:
+            self.storage.title_event(request, 'timeout')
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # CLI errors can contain credentials or pages of provider HTML. Keep
+            # only the outcome; the user's successful answer is unaffected.
+            self.storage.title_event(request, 'failed')
+
     async def idle(self):
         """Wait for accepted work; useful to embedding callers and tests."""
         while any(not job.done() for job in self.workers.values()):
@@ -481,10 +540,11 @@ class Gateway:
 
     async def shutdown(self):
         self.begin_shutdown()
-        for job in self.workers.values():
+        jobs = [*self.workers.values(), *self.title_jobs.values()]
+        for job in jobs:
             job.cancel()
-        await asyncio.gather(*self.workers.values(), return_exceptions=True)
-        await asyncio.gather(*(e.shutdown() for e in self.executors.values()))
+        await asyncio.gather(*jobs, return_exceptions=True)
+        await asyncio.gather(*(e.shutdown() for e in (*self.executors.values(), *self.title_executors.values())))
 
 
 def snippet(text, limit=200):
@@ -506,7 +566,9 @@ def task_title(task):
 
 
 def _stamp(value):
-    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(value)
+    # SQLite CURRENT_TIMESTAMP is naive UTC; ISO timestamps retain their offset.
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
 def compact(seconds):

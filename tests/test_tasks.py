@@ -386,7 +386,7 @@ def test_migration_three_preserves_v2_sessions_turns_and_legacy_column(tmp_path)
         db.execute("INSERT INTO raw_event(turn_id,sequence,stream,payload,kinds,events,created_at) VALUES (2,1,'meta',?,'[]','[]','2099-01-01 00:00:00')", (payload,))
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 3
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 4
         assert dict(store.session(1, 'claude')) == {'task_id': 1, 'executor': 'claude', 'session_id': 'old-session', 'synced_inbound_id': 1}
         assert store.task(1, 1)['session_id'] == 'old-session'
         assert store.task(1, 1)['last_active'] == '2099-01-01 00:00:00'
@@ -488,3 +488,31 @@ async def test_task_list_shows_compact_lifetime(held):
     detail = {name: lines[i + 1] for name in ('young', 'hours', 'days') for i, line in enumerate(lines) if f'`{name}`' in line}
     assert detail['hours'].endswith('· just now · over 5h') and detail['days'].endswith('· just now · over 3d')
     assert 'over' not in detail['young']
+
+
+@pytest.mark.parametrize('seconds,label', [(0, '0m'), (59, '0m'), (60, '1m'),
+                         (3599, '59m'), (3600, '1h'), (86399, '23h'), (86400, '1d')])
+def test_duration_boundaries_and_lifetime(seconds, label):
+    from datetime import datetime, timedelta, timezone
+    from eivoh.gateway import compact, lifetime
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert compact(seconds) == label
+    task = {'created_at': start.isoformat(), 'last_active': (start + timedelta(seconds=seconds)).isoformat()}
+    assert lifetime(task) == (f' · over {label}' if seconds >= 60 else '')
+
+
+def test_timestamp_offsets_and_future_age(monkeypatch):
+    from datetime import datetime, timezone
+    import eivoh.gateway as module
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, 'datetime', Clock)
+    assert module.relative_time('2026-01-01 11:00:00') == '1h ago'
+    assert module.relative_time('2026-01-01T13:00:00+02:00') == '1h ago'
+    assert module.relative_time('2026-01-02T00:00:00Z') == 'just now'
+    assert module.lifetime({'created_at': '2026-01-01 11:00:00',
+                            'last_active': '2026-01-01T14:00:00+02:00'}) == ' · over 1h'
+    assert module.lifetime({'created_at': '2026-01-01T12:00:00Z',
+                            'last_active': '2026-01-01T10:00:00Z'}) == ''

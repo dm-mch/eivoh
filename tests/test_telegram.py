@@ -57,6 +57,58 @@ async def test_flood_backoff_serializes_chat(monkeypatch):
     assert sleeps[0] > 0
 
 
+async def test_typing_survives_task_switch_during_edit_flood(tmp_path, monkeypatch, caplog):
+    from conftest import until
+    from test_tasks import HeldExecutor
+    from eivoh.channels.base import Inbound
+    from eivoh.gateway import Gateway
+    from eivoh.storage import Storage
+    monkeypatch.setenv('PTB_TIMEDELTA', '1')
+    bot = make_bot()
+    channel = TelegramChannel('unused', 1, bot)
+    executor = HeldExecutor()
+    store = Storage(tmp_path / 'typing.db')
+    gateway = Gateway(store, executor, {'telegram': channel}, edit_interval=0, typing_interval=0.01)
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_sleep = asyncio.sleep
+    async def flood_sleep(delay):
+        if delay >= 1:
+            entered.set()
+            await release.wait()
+        else:
+            await real_sleep(delay)
+    monkeypatch.setattr('eivoh.channels.telegram.asyncio.sleep', flood_sleep)
+    def message(mid, text):
+        return Inbound('telegram', '10', '1', str(mid), text)
+    switching = None
+    try:
+        await gateway.receive(message(1, 'long running task'))
+        await until(lambda: bot.send_message.call_count and bot.send_chat_action.call_count)
+        bot.edit_message_text.side_effect = [RetryAfter(5), True]
+        await gateway.receive(message(2, '/new second task'))
+        await asyncio.wait_for(entered.wait(), 1)
+        # Switch is durable even though its confirmation waits behind the edit.
+        switching = asyncio.create_task(gateway.receive(message(3, '/task 1')))
+        await until(lambda: store.active_task(1)['id'] == 1)
+        previous = bot.send_chat_action.call_count
+        # A refused typing action is dropped, then the next cycle tries again.
+        bot.send_chat_action.side_effect = [RetryAfter(5), True, True, True]
+        await until(lambda: bot.send_chat_action.call_count >= previous + 2)
+        bot.send_chat_action.side_effect = None
+        assert not switching.done() and store.turn_for(1)['status'] == 'running'
+        assert 'Telegram flood control' in caplog.text and 'waiting 5 s' in caplog.text
+        release.set()
+        await switching
+        await gateway.receive(message(4, '/stop'))
+        assert not gateway.workers
+    finally:
+        release.set()
+        if switching:
+            await switching
+        await gateway.shutdown()
+        store.close()
+
+
 async def test_chunk_edit_grows_and_shrinks():
     bot = make_bot()
     counter = 0
