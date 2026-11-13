@@ -6,7 +6,7 @@ See [ROADMAP.md](ROADMAP.md) for the current stage and what already works. The c
 
 # Before a task
 
-1. Always read this file and the current-stage section of [ROADMAP.md](ROADMAP.md). Read the rest as the task requires; for a substantial task, or when in doubt, read everything.
+1. Always read this file and, in [ROADMAP.md](ROADMAP.md), the section "How the plan works" and the section of the current stage. Read the rest as the task requires; for a substantial task, or when in doubt, read everything.
    * Goals, values, choice of direction: [VISION.md](VISION.md).
    * Components, channels, executors, code: [ARCHITECTURE.md](ARCHITECTURE.md).
    * Reflection, self-modification, checking changes, recovery: [EVOLUTION.md](EVOLUTION.md).
