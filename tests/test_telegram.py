@@ -46,12 +46,14 @@ async def test_flood_backoff_serializes_chat(monkeypatch):
     monkeypatch.setattr('eivoh.channels.telegram.asyncio.sleep', sleep)
     edit = asyncio.create_task(channel.edit('10', '5', 'new'))
     await entered.wait()
-    typing = asyncio.create_task(channel.typing('10'))
-    assert bot.send_chat_action.call_count == 0
+    send = asyncio.create_task(channel.send('10', 'waits behind the back-off'))
+    await channel.typing('10')  # The sign of life is not queued behind deliveries.
+    assert bot.send_chat_action.call_count == 1 and bot.send_message.call_count == 0
     release.set()
-    await asyncio.gather(edit, typing)
-    assert bot.edit_message_text.call_count == 2
-    assert bot.send_chat_action.call_count == 1
+    await asyncio.gather(edit, send)
+    assert bot.edit_message_text.call_count == 2 and bot.send_message.call_count == 1
+    bot.send_chat_action.side_effect = RetryAfter(5)
+    await channel.typing('10')  # Best-effort: a refused indicator is dropped.
     assert sleeps[0] > 0
 
 

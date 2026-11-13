@@ -109,7 +109,7 @@ class TelegramChannel:
         return text
 
     async def _request(self, chat, method, **kwargs):
-        # One lock covers sends, edits, deletes and typing, including RetryAfter.
+        # One lock covers sends, edits and deletes, including RetryAfter.
         async with self.locks.setdefault(chat, asyncio.Lock()):
             for attempt in range(3):
                 delay = self.blocked_until.get(chat, 0) - asyncio.get_running_loop().time()
@@ -121,6 +121,8 @@ class TelegramChannel:
                     delay = exc.retry_after
                     delay = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
                     self.blocked_until[chat] = asyncio.get_running_loop().time() + delay + 0.1
+                    # Visible evidence: deliveries to this chat pause for this long.
+                    log.warning("Telegram flood control on %s: waiting %.0f s", getattr(method, "__name__", "request"), delay)
                     if attempt == 2:
                         log.warning("Telegram flood limit persists; delivery skipped")
                 except BadRequest as exc:
@@ -174,4 +176,9 @@ class TelegramChannel:
         return [mid for mid in self.messages.get((chat_id, message_id), [message_id]) if mid is not None]
 
     async def typing(self, chat_id):
-        await self._request(chat_id, self.bot.send_chat_action, action="typing")
+        # Outside the delivery lock and its flood back-off: the indicator is the
+        # only sign of life while edits wait, and a lost one needs no retry.
+        try:
+            await self.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except TelegramError as exc:
+            log.debug("Typing indicator not sent: %s", type(exc).__name__)
