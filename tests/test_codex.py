@@ -101,11 +101,12 @@ async def test_new_codex_task_runs_and_resumes(codex_rig):
     await gateway.receive(inbound(2, 'hello'))
     await gateway.receive(inbound(3, 'again'))
     await gateway.idle()
-    assert any('New task on codex' in text for _, text in channel.sent)
+    assert any('New task 1' in text and 'codex/default' in text for _, text in channel.sent)
     first, second = storage.turn_for(2), storage.turn_for(3)
     assert first['status'] == second['status'] == 'completed'
     task = storage.db.execute('SELECT * FROM task WHERE id=?', (first['task_id'],)).fetchone()
-    assert task['executor'] == 'codex' and task['session_id'] == first['session_id'] == second['session_id']
+    assert task['executor'] == 'codex'
+    assert storage.session(task['id'], 'codex')['session_id'] == first['session_id'] == second['session_id']
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     assert 'resume' not in calls[0]['args'] and calls[1]['args'][-3] == 'resume'
     assert calls[1]['args'][-2] == first['session_id'] and not any(c['openai'] for c in calls)
@@ -151,11 +152,12 @@ async def test_codex_stop_leaves_no_orphans(codex_rig):
     await until(gone)
 
 
-async def test_unknown_executor_is_refused(codex_rig):
+async def test_unrecognized_new_word_is_title(codex_rig):
     gateway, storage, codex, channel, log = codex_rig
     await gateway.receive(inbound(1, '/new gemini'))
     await gateway.idle()
-    assert any('Unknown executor `gemini`' in text for _, text in channel.sent)
+    assert storage.active_task(1)['title'] == 'gemini'
+    assert storage.active_task(1)['executor'] == 'claude'
     assert storage.pending() == []
 
 
@@ -195,6 +197,7 @@ async def test_model_cross_executor_handoff_and_resume(codex_rig, tmp_path):
     assert storage.turn_for(2) is None
     assert any('transcript of 1 earlier turns' in text for _, text in channel.sent)
     await gateway.receive(inbound(3, 'what word?'))
+    await gateway.idle()
     await gateway.receive(inbound(4, '/model gpt-6.1-sol'))
     await gateway.receive(inbound(5, 'another question'))
     await gateway.idle()
@@ -209,13 +212,21 @@ async def test_model_cross_executor_handoff_and_resume(codex_rig, tmp_path):
     assert calls[1]['args'][calls[1]['args'].index('-m') + 1] == 'gpt-6.1-sol'
     assert storage.turn_for(3)['session_id'] == storage.turn_for(5)['session_id']
     assert storage.turn_for(1)['session_id'] == original['session_id']
-    # Switching back also starts a new native session, carrying the task history.
+    # Switching back resumes the original native session with only missed turns.
     await gateway.receive(inbound(6, '/model sonnet'))
+    missed, count, _ = storage.missed_transcript(original['task_id'], 'claude', 6)
+    assert count == 2 and missed.startswith('User:\nwhat word?\n')
+    assert any('transcript of 2 earlier turns' in text for _, text in channel.sent)
     await gateway.receive(inbound(7, 'back on claude'))
     await gateway.idle()
     claude_calls = [json.loads(line) for line in (tmp_path / 'prompts.jsonl').read_text().splitlines()]
-    assert claude_calls[-1]['resume'] is None
-    assert 'User:\nremember violet' in claude_calls[-1]['prompt']
+    assert claude_calls[-1]['resume'] == original['session_id']
+    # The fake's answer quotes its prompt, so nested history can occur in an
+    # answer; only the two missed turns should be added by Eivoh itself.
+    assert claude_calls[-1]['prompt'] == ("Since your last turn in this conversation, the same user continued this task with another model. "
+                                         "Eivoh, the gateway running you, recorded those turns; they are part of this conversation's history:\n\n" +
+                                         missed + 'End of transcript.\n\nCurrent request:\nback on claude')
+    assert 'User:\nwhat word?' in claude_calls[-1]['prompt']
     assert 'Assistant:\necho:' in claude_calls[-1]['prompt']
     assert claude_calls[-1]['prompt'].endswith('Current request:\nback on claude')
 
@@ -226,6 +237,7 @@ async def test_model_handoff_survives_reopen_before_session(codex_rig, tmp_path,
     gateway, storage, codex, channel, log = codex_rig
     model_cache(tmp_path / 'models_cache.json')
     await gateway.receive(inbound(1, 'remember violet'))
+    await gateway.idle()
     await gateway.receive(inbound(2, '/model astra'))
     await gateway.idle()
     row = storage.journal(inbound(3, 'continue after restart'))
@@ -256,6 +268,7 @@ async def test_handoff_survives_repeated_restart_after_session_started(codex_rig
     gateway, storage, codex, channel, log = codex_rig
     model_cache(tmp_path / 'models_cache.json')
     await gateway.receive(inbound(1, 'remember violet'))
+    await gateway.idle()
     await gateway.receive(inbound(2, '/model astra'))
     await gateway.idle()
     row = storage.journal(inbound(3, 'what word?'))

@@ -149,7 +149,67 @@ async def test_commands_registered_once_and_failure_does_not_stop_poll(registrat
     with pytest.raises(asyncio.CancelledError):
         await channel.poll(AsyncMock())
     bot.set_my_commands.assert_awaited_once()
-    assert [name for name, _ in bot.set_my_commands.call_args.args[0]] == ['new', 'model', 'stop']
+    assert [name for name, _ in bot.set_my_commands.call_args.args[0]] == ['new', 'tasks', 'model', 'stop', 'close', 'title']
     assert bot.get_updates.await_count == 2
     if registration_error:
         assert 'command registration failed' in caplog.text
+
+
+async def test_buttons_on_last_chunk_and_label_is_literal():
+    from eivoh.channels.formatting import plain_text, utf16_len
+    bot = make_bot()
+    channel = TelegramChannel('unused', 1, bot)
+    buttons = [[('3 · Title', '/task 3')], [('Older ›', '/tasks 2')]]
+    text = '#t3 **Title**\n' + '😀' * 6000
+    await channel.send('10', text, buttons)
+    calls = bot.send_message.call_args_list
+    assert len(calls) > 1
+    assert all('reply_markup' not in call.kwargs for call in calls[:-1])
+    keyboard = calls[-1].kwargs['reply_markup'].inline_keyboard
+    assert [[(button.text, button.callback_data) for button in row] for row in keyboard] == buttons
+    assert ''.join(plain_text(call.kwargs['text']) for call in calls) == text
+    assert all(utf16_len(call.kwargs['text']) <= 4096 for call in calls)
+
+
+async def test_poll_callbacks_authorization_ack_and_stable_id():
+    bot = make_bot()
+    received = []
+    callbacks = []
+    def update(uid, owner=1, kind='private', data='/task 3', failure=False):
+        callback = SimpleNamespace(id='press-' + str(uid), data=data,
+                                   answer=AsyncMock(side_effect=NetworkError('offline') if failure else None))
+        callbacks.append(callback)
+        return SimpleNamespace(update_id=uid, effective_user=SimpleNamespace(id=owner),
+                               effective_chat=SimpleNamespace(id=10, type=kind),
+                               effective_message=SimpleNamespace(message_id=20, text='Task list'),
+                               callback_query=callback)
+    updates = [update(1, owner=2), update(2, kind='group'), update(3), update(4, failure=True), update(5, data='bad payload')]
+    updates.append(updates[2])  # Same callback id remains deduplicable on redelivery.
+    bot.get_updates = AsyncMock(side_effect=[updates, asyncio.CancelledError()])
+    async def receive(message):
+        received.append(message)
+    with pytest.raises(asyncio.CancelledError):
+        await TelegramChannel('unused', 1, bot).poll(receive)
+    assert [msg.message_id for msg in received] == ['cb:press-3', 'cb:press-4', 'cb:press-5', 'cb:press-3']
+    assert [msg.text for msg in received] == ['/task 3', '/task 3', 'bad payload', '/task 3']
+    assert all(msg.reply_to is None for msg in received)
+    assert callbacks[0].answer.await_count == callbacks[1].answer.await_count == 0
+    assert all(callback.answer.await_count for callback in callbacks[2:])
+    assert bot.get_updates.call_args.kwargs['allowed_updates'] == ['message', 'callback_query']
+
+
+@pytest.mark.parametrize('voice', [False, True])
+async def test_reply_to_forwarded_for_text_and_voice(voice):
+    bot = make_bot()
+    bot.get_file = AsyncMock(return_value=SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b'ogg'))))
+    transcriber = SimpleNamespace(transcribe=AsyncMock(return_value='spoken'))
+    message = SimpleNamespace(message_id=9, text=None if voice else 'typed', audio=None,
+                              voice=SimpleNamespace(file_id='audio') if voice else None,
+                              reply_to_message=SimpleNamespace(message_id=7))
+    update = SimpleNamespace(update_id=1, effective_user=SimpleNamespace(id=1),
+                             effective_chat=SimpleNamespace(id=10, type='private'), effective_message=message)
+    bot.get_updates = AsyncMock(side_effect=[[update], asyncio.CancelledError()])
+    receive = AsyncMock()
+    with pytest.raises(asyncio.CancelledError):
+        await TelegramChannel('unused', 1, bot, transcriber).poll(receive)
+    assert receive.call_args.args[0].reply_to == '7'

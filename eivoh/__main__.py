@@ -24,7 +24,7 @@ async def serve(config: Config):
     executor = executors.pop(config.default_executor)
     transcriber = make_transcriber(config.stt_provider, os.environ)
     channel = TelegramChannel(config.telegram_token, config.owner_id, transcriber=transcriber)
-    gateway = Gateway(storage, executor, {"telegram": channel}, executors=executors)
+    gateway = Gateway(storage, executor, {"telegram": channel}, executors=executors, max_parallel=config.max_parallel)
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     def stop_requested():

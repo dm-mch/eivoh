@@ -7,7 +7,7 @@ import asyncio
 from datetime import timedelta
 import logging
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 
 from ..speech import TranscriptionError
@@ -33,8 +33,11 @@ class TelegramChannel:
         try:
             await self.bot.set_my_commands([
                 ("new", "Start a new task"),
+                ("tasks", "List and switch tasks"),
                 ("model", "Show or change the task model"),
                 ("stop", "Stop running and queued work"),
+                ("close", "Close a task"),
+                ("title", "Rename a task"),
             ])
         except Exception as exc:
             log.warning("Telegram command registration failed: %s", type(exc).__name__)
@@ -42,7 +45,7 @@ class TelegramChannel:
         while True:
             try:
                 updates = await self.bot.get_updates(offset=offset, timeout=30, read_timeout=35,
-                                                     allowed_updates=["message"])
+                                                     allowed_updates=["message", "callback_query"])
             except RetryAfter as exc:
                 delay = exc.retry_after
                 delay = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
@@ -56,20 +59,31 @@ class TelegramChannel:
                 message = update.effective_message
                 user = update.effective_user
                 chat = update.effective_chat
+                callback = getattr(update, 'callback_query', None)
+                replied = getattr(message, 'reply_to_message', None)
+                reply_to = str(replied.message_id) if replied else None
                 if not user or user.id != self.owner_id or not chat or chat.type != "private":
                     log.info("Ignored Telegram update from non-owner or non-private chat")
+                elif callback:
+                    try:
+                        await callback.answer()
+                    except TelegramError:
+                        log.warning("Could not acknowledge Telegram callback")
+                    if isinstance(callback.data, str):
+                        await receive(Inbound("telegram", str(chat.id), str(user.id),
+                                              f"cb:{callback.id}", callback.data, button=True))
                 elif message and message.text:
                     # Do not request the next offset (acknowledge the batch) until
                     # the gateway has committed each accepted inbound to SQLite.
                     await receive(Inbound("telegram", str(chat.id), str(user.id),
-                                          str(message.message_id), message.text))
+                                          str(message.message_id), message.text, reply_to))
                 elif message and (message.voice or message.audio):
                     # Transcribed before journaling: a crash here leaves the update
                     # unacknowledged, so it is fetched and transcribed again.
                     text = await self._transcribe(str(chat.id), message.voice or message.audio)
                     if text:
                         await receive(Inbound("telegram", str(chat.id), str(user.id),
-                                              str(message.message_id), VOICE_PREFIX + text))
+                                              str(message.message_id), VOICE_PREFIX + text, reply_to))
                 offset = update.update_id + 1
 
     async def _transcribe(self, chat, media):
@@ -125,10 +139,15 @@ class TelegramChannel:
                     return None
         return None
 
-    async def send(self, chat_id, text):
+    async def send(self, chat_id, text, buttons=None):
         ids = []
-        for chunk in render_chunks(text):
-            message = await self._request(chat_id, self.bot.send_message, text=chunk, parse_mode="HTML")
+        chunks = render_chunks(text)
+        for index, chunk in enumerate(chunks):
+            extra = {}
+            if buttons and index == len(chunks) - 1:
+                extra['reply_markup'] = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(label, callback_data=data) for label, data in row] for row in buttons])
+            message = await self._request(chat_id, self.bot.send_message, text=chunk, parse_mode="HTML", **extra)
             ids.append(str(message.message_id) if message else None)
         if not ids or ids[0] is None:
             return None
@@ -149,6 +168,10 @@ class TelegramChannel:
             if mid is not None:
                 await self._request(chat_id, self.bot.delete_message, message_id=int(mid))
         del ids[len(chunks):]
+
+    def parts(self, chat_id, message_id):
+        """All message ids currently carrying one logical message (long answers are split)."""
+        return [mid for mid in self.messages.get((chat_id, message_id), [message_id]) if mid is not None]
 
     async def typing(self, chat_id):
         await self._request(chat_id, self.bot.send_chat_action, action="typing")

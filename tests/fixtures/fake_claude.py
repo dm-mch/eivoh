@@ -42,7 +42,8 @@ if prompt in {"hang", "crash", "complete-with-child", "stderr-flood"}:
 import subprocess, os, json, time
 from pathlib import Path
 p = subprocess.Popen(["sleep", "60"], start_new_session=True)
-Path("pids.json").write_text(json.dumps([os.getpid(), p.pid]))
+Path("pids.json.tmp").write_text(json.dumps([os.getpid(), p.pid]))
+os.replace("pids.json.tmp", "pids.json")  # Atomic: tests read it as soon as it exists.
 time.sleep(60)
 '''], start_new_session=True)
     while not Path("pids.json").exists():

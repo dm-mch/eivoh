@@ -32,10 +32,11 @@ The target system runs continuously on a VM, supports interchangeable communicat
 
 The public core contains the shared documents and code. The private/ folder is the private part, kept in a separate repository: experience, correspondence, archives and state. The agent makes core changes on the working branch `work`; they reach `main` through a PR. The rules for changes and publication are in [AGENTS.md](AGENTS.md).
 
-# Operating V1
+# Operating the gateway
 
 Linux and a separately installed Claude Code with subscription login are required.
-The gateway is built; live integration and real-use acceptance remain unverified.
+The gateway is built. Parallel tasks and the new task interface are verified offline;
+live use of these changes is unverified.
 From `~/src/eivoh`:
 
 ```sh
@@ -62,6 +63,7 @@ EIVOH_WORKDIR=/home/your-user/src/eivoh
 # EIVOH_CLAUDE_BIN=claude
 # EIVOH_CLAUDE_ARGS=
 # EIVOH_DEFAULT_EXECUTOR=claude
+# EIVOH_MAX_PARALLEL=3
 # EIVOH_CODEX_BIN=codex
 # EIVOH_CODEX_MODEL=
 # EIVOH_CODEX_ARGS=
@@ -117,21 +119,51 @@ IDs or aliases. Codex's catalog is read on demand from
 `$CODEX_HOME/models_cache.json` (default `~/.codex/models_cache.json`), using only
 entries with `visibility: "list"`; an unreadable cache gives an empty list.
 
-Model selection is stored per task. Within the same executor it keeps the native
-session; switching between Claude and Codex clears the session and starts a new
-one on the next message. Eivoh passes earlier user texts and stored final answers
-as a transcript, oldest first, capped at 30,000 characters including truncation
-markers. It prefers recent whole turns; if the newest turn cannot fit, it keeps
-the beginning and end of both user and assistant text with role labels and explicit
-omission markers. This transfers conversation text, not native
-tool/session state; turns without a stored final answer are marked as such.
-The switch reply reports the number of included turns. With no active task,
-selection creates one. Telegram's `/new`, `/model` and `/stop` menu is registered
-once at polling startup, best-effort. Migration, model selection, CLI arguments,
-session reuse, transcript handoff, recovery and menu registration are tested
-offline with fakes. In live use, selection by name and number and a transcript
-handoff in both directions were observed once; handoff recovery after a restart
-remains unverified.
+Model selection is stored per task and applies immediately to turns that have not
+been claimed yet. A running or recovering turn keeps its recorded executor/model.
+Each task keeps a native session separately for Claude and Codex: switching back
+resumes that executor's original session. Eivoh passes only the earlier turns
+that executor has missed since its last finished turn (the whole bounded history
+for a new session). The transcript contains user texts and stored final answers,
+oldest first, capped at 30,000 characters including truncation markers. It prefers
+recent whole turns; if the newest turn cannot fit, it keeps the beginning and end
+of both user and assistant text with role labels and omission markers. This
+transfers conversation text, not native tool state. Turns without a stored final
+answer are marked as such. The switch reply reports the currently included turn
+count; zero is shown as “Context kept (same session)”. With no current task,
+model selection creates one.
+
+Chat commands:
+
+* `/new [claude|codex] [title…]` creates a task and makes it current. The previous
+  task stays open and keeps running. An unrecognized first word is part of the title.
+* `/tasks [page]` lists open tasks, most recently active first, eight per page.
+  Each entry shows its number, title, executor/model, running/queued/idle state
+  and time since activity. Buttons switch tasks or change pages; the list reports
+  how many other open tasks exist. `/tasks all [page]` includes closed tasks.
+* `/task N` switches to task N, reopening it if closed, and shows short excerpts
+  of its last user message and stored answer. `/task` lists tasks.
+* `/stop [N]` cancels running and queued work for the target task, keeping it open.
+  `/stop all` cancels work in every task of this conversation.
+* `/close [N]` stops and closes the target task. If it was current, the most recently
+  active open task becomes current, or none if there are no open tasks.
+* `/title <text>` renames the target task. Otherwise its first message supplies a
+  title: voice prefix removed, whitespace collapsed, shortened to 40 characters.
+* `/model [name or number]` shows or changes the target task's model as described above.
+
+For `/stop`, `/close`, `/model` and `/title`, an explicit task number (where the
+syntax allows one) takes priority, then a replied-to task, then the current task.
+The number in `/model` selects a model, not a task. Unknown task numbers and tasks
+from another conversation are refused. Tasks are never automatically closed.
+Telegram registers new, tasks, model, stop, close and title in its command menu;
+inline button commands use the same validation and durable deduplication as typing.
+Answers and task-specific notices get a `#tN Title` label when more than one task
+is open or the answer belongs to a task other than the current one. Labels are
+for display only and are excluded from stored results and transcripts.
+
+Migration, routing, parallel limits, reply targets, task controls, per-executor
+sessions and restart recovery have offline fake-executor coverage. Live use of
+the parallel task interface and session switching changes is unverified.
 
 Only the numeric owner in a private chat is admitted. Use one instance and a
 dedicated token; multi-instance locking belongs to V2.
@@ -168,21 +200,40 @@ the host's user-manager configuration. Release orchestration is tested with
 command stubs; actual worktree creation, uv installation and systemd operation
 have not been exercised by this review-fix task.
 
-Messages are turns within the active task and continue its executor session in
-FIFO order. `/model` takes its place in that queue without creating a turn and
-applies to subsequent messages. `/new` closes the previous task in FIFO order and
-creates a new active task with no session. Queued turns bind to the active task
-at dispatch. `/stop` bypasses the queue, cancels the running turn and all earlier
-queued messages (including `/new` and `/model`), and
-reports the task IDs and queued count. Cancelled messages remain in the journal.
+Messages become turns bound to a task when journaled; that binding never changes.
+A reply to a known owner message, or to any part of an answer or task-specific
+notice, goes to that task and reopens it if closed. Only the seven commands above
+are commands: other text starting with `/` (a path, an executor's own command) is
+an ordinary message. Unknown reply targets fall
+back to the current task. With neither a known target nor a current task, a new
+current task is created. Reply routing itself does not switch the current task.
+Each task has its own FIFO queue and worker. Different tasks run concurrently,
+bounded globally by `EIVOH_MAX_PARALLEL` (default 3, integer at least 1); turns
+waiting for a slot stay queued. Commands run immediately in arrival order under
+the conversation lock, create no turns, and never wait behind executor work.
+Cancellation is committed before terminating the target task's process tree.
+Cancelled messages remain in the journal.
+
+Known limitation: parallel tasks share one working tree (`EIVOH_WORKDIR`) and can
+edit the same files. Task isolation, such as a worktree per task, is not built.
 
 SQLite (`eivoh.sqlite3` in the state directory) uses WAL and synchronous FULL for
 durable inbound commits before processing and polling acknowledgment. Schema
 changes use ordered transactional migrations and `PRAGMA user_version`; migration
 1 assumes a new database, with no upgrade from the unreleased prototype layout.
 Migration 2 upgrades version 1 in place, adding a nullable task model.
-Conversations point to active tasks; tasks own executor/model choice and session ID;
-turns retain their observed session ID and raw events. Launch metadata separates
+Migration 3 adds task titles/activity timestamps, turn executor/model snapshots,
+reply targets, a per-(task, executor) session table with transcript progress, and
+a map from bot message IDs (every part of a split answer) to their task and turn
+for reply routing. It backfills activity, launch settings and one session for each
+executor a task has used, where derivable. Version 2 bound queued messages to a
+task only at dispatch, so upgrade when no `/new` is waiting in the queue: a message
+queued behind it would stay in the earlier task. The old task session column is
+retained but no longer read or updated. This does not make the previous release
+compatible: its schema-version guard rejects version 3. A rollback needs a
+compatible release or a separately planned database restore.
+Conversations point to one current task among their open tasks; turns retain
+observed session IDs and raw events. Launch metadata separates
 the requested model and its source from a configured-model hint (Codex config)
 and the observed model, which is unknown at launch. Claude's init and main assistant
 events retain model observations with their respective sources; an init report
@@ -197,19 +248,22 @@ Killing the supervisor itself with SIGKILL, uninterruptible processes, and work
 launched through external services are outside this cleanup guarantee; systemd
 provides an additional containment layer. Interrupted turns remain recoverable.
 
-Restart recovery finalizes a stored result and delivers its answer without
-launching the executor again. Otherwise it resumes the task session with the
-original request and a reminder to check existing work, or sends the original
-request when no session exists. The assembled original prompt, including any
-cross-executor transcript, is journaled before launch and reused on recovery:
-a session ID alone does not acknowledge receipt of the first prompt. Older pending
-turns without that metadata reconstruct the transcript when no earlier turn shares
-the resumed session; ordinary same-session resumes keep only the current request.
+Restart recovery first applies journaled but unfinished commands in ID order,
+then starts per-task workers. It finalizes a stored result and delivers its answer
+without launching the executor again. Otherwise it uses the turn's recorded
+executor/model and that executor's task session, with the original request and a
+reminder to check existing work when resuming. The assembled prompt, including
+any missed transcript, is journaled before launch and reused on recovery: a session
+ID alone does not acknowledge receipt of the first prompt. Legacy pending turns
+without prompt metadata reconstruct it using the session's transcript progress.
 Three automatic recovery attempts are allowed
 per turn before visible failure. Errors/results emitted after shutdown begins
 remain in the raw journal but cannot finalize the interrupted turn on replay.
 External tool effects are not exactly-once: an action may precede its persisted
-result. Outbound Telegram IDs are not durable, so recovery can post a new answer.
+result. The first ID of an answer or task-specific notice is durable for reply routing;
+split-message edit state and delivery acknowledgments remain ephemeral, so recovery
+can still post a new answer. A crash between sending and storing an outbound ID
+can leave that message without a reply mapping.
 Polling honors flood-control delays without advancing its offset. Final answer
 delivery waits up to 60 seconds, including flood-control backoff, and is cancelled
 by shutdown. Ambiguous send timeouts are not retried. Interactive approvals are not implemented;

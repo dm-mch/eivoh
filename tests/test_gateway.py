@@ -25,11 +25,12 @@ async def test_progressive_fifo_resume_new_and_dedupe(rig):
     await gateway.receive(inbound(4, 'third'))
     await asyncio.wait_for(gateway.idle(), 5)
     logs = prompts(path)
-    assert [x['prompt'] for x in logs] == ['first', 'second', 'third']
-    assert logs[1]['resume'] == logs[0]['sid']
-    assert logs[2]['resume'] is None
+    by_prompt = {x['prompt']: x for x in logs}
+    assert set(by_prompt) == {'first', 'second', 'third'}
+    assert by_prompt['second']['resume'] == by_prompt['first']['sid']
+    assert by_prompt['third']['resume'] is None
     assert channel.edits and channel.typings
-    assert any(text == 'Working done: first' for _, _, text in channel.edits)
+    assert any(text.endswith('Working done: first') and text.startswith('#t1 ') for _, _, text in channel.edits)
     assert storage.db.execute("SELECT COUNT(*) FROM turn WHERE status='completed'").fetchone()[0] == 3
     assert storage.db.execute("SELECT COUNT(*) FROM raw_event WHERE raw_line LIKE '%rate_limit_event%'").fetchone()[0] == 3
     count = len(channel.typings)
@@ -45,14 +46,14 @@ async def test_stop_cleans_setsid_grandchild_and_cancels_queue(rig):
     pids = json.loads((path / 'pids.json').read_text())
     pids += [tree.process.pid for tree in executor.running.values()]
     await gateway.receive(inbound(2, 'queued'))
-    await gateway.receive(inbound(3, '/new'))
+    await gateway.receive(inbound(3, '/model opus'))
     await gateway.receive(inbound(4, '/stop'))
     await gateway.idle()
     assert not any(pid in process_table() for pid in pids)
     assert storage.turn_for(1)['status'] == 'cancelled'
     assert storage.turn_for(2)['status'] == 'cancelled'
-    assert storage.inbound(3)['state'] == 'cancelled'
-    assert any('Cancelled 2 queued' in text for _, text in channel.sent)
+    assert storage.inbound(3)['state'] == 'done'
+    assert any('Cancelled 1 queued' in text for _, text in channel.sent)
     assert len(prompts(path)) == 1
     assert storage.db.execute("SELECT COUNT(*) FROM raw_event WHERE raw_line LIKE '%shutdown_notice%'").fetchone()[0] == 1
     await gateway.receive(inbound(5, 'after'))
@@ -244,10 +245,11 @@ async def test_crash_before_resume_process_emits_id_keeps_original_prompt(rig):
     assert storage.turn_for(2)['status'] == 'completed'
 
 
-async def test_model_same_executor_is_fifo_and_keeps_session(rig):
+async def test_model_same_executor_applies_immediately_and_keeps_session(rig):
     gateway, storage, _, channel, path = rig
     await gateway.receive(inbound(1, '/model haiku'))
     await gateway.receive(inbound(2, 'first'))
+    await until(lambda: storage.turn_for(2)['session_id'])
     await gateway.receive(inbound(3, '/model claude-sonnet-5-5'))
     await gateway.receive(inbound(4, 'second'))
     await gateway.idle()
@@ -289,13 +291,13 @@ async def test_model_listing_and_number_snapshot(rig, monkeypatch):
     assert '1. changed-model' in channel.sent[-1][1]
 
 
-async def test_stop_cancels_queued_model_command(rig):
+async def test_stop_does_not_undo_applied_model_command(rig):
     gateway, storage, _, _, path = rig
     await gateway.receive(inbound(1, 'hang'))
     await until(lambda: (path / 'pids.json').exists())
     await gateway.receive(inbound(2, '/model opus'))
     await gateway.receive(inbound(3, '/stop'))
     await gateway.idle()
-    assert storage.inbound(2)['state'] == 'cancelled'
-    assert storage.active_task(1)['model'] is None
+    assert storage.inbound(2)['state'] == 'done'
+    assert storage.active_task(1)['model'] == 'opus'
     assert storage.turn_for(2) is None
