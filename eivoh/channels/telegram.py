@@ -36,6 +36,7 @@ class TelegramChannel:
                 ("tasks", "List and switch tasks"),
                 ("model", "Show or change the task model"),
                 ("stop", "Stop running and queued work"),
+                ("q", "Queue a message after the running turn"),
                 ("close", "Close a task"),
                 ("title", "Rename a task"),
             ])

@@ -10,7 +10,7 @@ import re
 import signal
 import sys
 
-from .base import Event, Record
+from .base import Event, Record, SteerResult
 
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -83,6 +83,10 @@ class ProcessTree:
 
 
 class CliExecutor:
+    supports_steer = False
+
+    async def steer(self, run_id, input_id, text):
+        return SteerResult("not_sent")
     def __init__(self, workdir: Path, binary, model=None, grace=0.5, extra_args=()):
         self.workdir = workdir
         self.binary = str(binary)

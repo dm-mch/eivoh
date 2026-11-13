@@ -81,7 +81,7 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
 def test_schema_version_reopen_and_future_rejected(tmp_path):
     path = tmp_path / 'version.db'
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 4
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 5
     store.journal(inbound(1, 'retained'))
     store.close()
     store = Storage(path)
@@ -141,7 +141,7 @@ def test_v1_upgrades_in_place(tmp_path):
                    "VALUES (1,1,1,1,'running','old-session')")
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 4
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 5
         task = store.active_task(1)
         assert task['model'] is None and task['session_id'] == 'old-session'
         turn, recovering = store.claim(1, 3)

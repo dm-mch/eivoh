@@ -97,16 +97,24 @@ class Gateway:
         self.title_jobs = {}
         self.replies = set()
         self.workers = {}
+        self.active_runs = {}
+        self.steer_jobs = {}
+        self.notice_jobs = {}
         self.locks = {}
         self.model_catalogs = {}  # Numbers refer to the last list shown in this process.
         self.closing = False
 
     async def start(self):
+        self.storage.recover_steering()
         # Commands have no turn. Replay them in journal order before any launch.
         for row in self.storage.pending():
             if self.storage.turn_for(row['id']) is None:
                 await self._command(row)
         for row in self.storage.pending():
+            delivery = self.storage.steering(row['id'])
+            if delivery and delivery['state'] == 'unknown':
+                task_id = self.storage.turn_for(row['id'])['task_id']
+                self._notice(row, f"Earlier delivery to task {task_id} could not be confirmed. Kept for recovery with a check for work already done.", task_id)
             self._kick(self.storage.turn_for(row['id'])['task_id'])
         for task in self.storage.title_candidates():
             self._name_task(task['id'])
@@ -128,6 +136,11 @@ class Gateway:
                 await self._command(row)
             else:
                 self._kick(turn['task_id'])
+                reserved = self._kick_steer(turn['task_id'])
+                if turn['force_queue']:
+                    self._notice(row, f"Queued for task {turn['task_id']} after earlier messages.", turn['task_id'])
+                elif turn['task_id'] in self.active_runs and row['id'] not in reserved:
+                    self._notice(row, f"Queued for task {turn['task_id']} after earlier messages, using the selected model.", turn['task_id'])
             for reply in self.replies:
                 reply.changed.set()  # A second task or switch may change labels.
 
@@ -142,6 +155,71 @@ class Gateway:
     async def _cancel_run(self, run_id):
         # Run ids are turn ids, unique across executors; cancel is a no-op elsewhere.
         await asyncio.gather(*(e.cancel(run_id) for e in self.executors.values()))
+
+    def _kick_steer(self, task_id):
+        reserved = set()
+        if self.closing or task_id not in self.active_runs:
+            return reserved
+        parent, executor = self.active_runs[task_id]
+        if not getattr(executor, 'supports_steer', False):
+            return reserved
+        rows = [row for row in self.storage.pending_task(task_id) if row['id'] != parent['inbound_id']]
+        for row in rows:
+            input_id = self.storage.reserve_steer(parent['id'], row['id'])
+            if input_id is None:
+                break  # FIFO barrier: /q, changed model, or uncertain delivery.
+            reserved.add(row['id'])
+            job = asyncio.create_task(self._deliver_steering(task_id, parent, executor, row, input_id))
+            self.steer_jobs.setdefault(task_id, set()).add(job)
+            def forget(done, task_id=task_id, inbound_id=row['id']):
+                if done.cancelled():
+                    # Covers cancellation before the coroutine's first step.
+                    self.storage.steer_outcome(inbound_id, 'unknown', 'Delivery interrupted')
+                jobs = self.steer_jobs.get(task_id)
+                if jobs is not None:
+                    jobs.discard(done)
+                    if not jobs:
+                        self.steer_jobs.pop(task_id, None)
+                if not done.cancelled() and (error := done.exception()):
+                    log.error('Task %s steering failed', task_id, exc_info=(type(error), error, error.__traceback__))
+            job.add_done_callback(forget)
+        return reserved
+
+    async def _deliver_steering(self, task_id, parent, executor, row, input_id):
+        try:
+            result = await executor.steer(parent['id'], input_id, row['text'])
+        except asyncio.CancelledError:
+            self.storage.steer_outcome(row['id'], 'unknown', 'Delivery interrupted')
+            raise
+        except Exception:
+            # A failed write is ambiguous. Freeze the transport before fallback.
+            await executor.cancel(parent['id'])
+            self.storage.steer_outcome(row['id'], 'unknown', 'Delivery failed without acknowledgement')
+        else:
+            state = {'accepted': 'accepted', 'not_sent': 'queued', 'rejected': 'queued', 'unknown': 'unknown'}[result.status]
+            self.storage.steer_outcome(row['id'], state, result.detail)
+        delivery = self.storage.steering(row['id'])
+        if self.storage.inbound(row['id'])['state'] == 'cancelled' or self.closing:
+            return
+        if delivery['state'] == 'accepted':
+            self._notice(row, f"Added to the running task {task_id}.", task_id)
+        else:
+            text = (f"Delivery to task {task_id} could not be confirmed. Kept for the next turn; it will check for work already done."
+                    if delivery['state'] == 'unknown' else f"Queued for task {task_id}; the running turn is ending.")
+            self._notice(row, text, task_id)
+            self._kick(task_id)  # An exceptional parent may have ended while this input was sending.
+
+    def _notice(self, row, text, task_id):
+        # Chat flood control must not hold transport completion or executor slots.
+        job = asyncio.create_task(self._send(row, text, task_id))
+        self.notice_jobs.setdefault(task_id, set()).add(job)
+        def forget(done):
+            jobs = self.notice_jobs.get(task_id)
+            if jobs is not None:
+                jobs.discard(done)
+                if not jobs:
+                    self.notice_jobs.pop(task_id, None)
+        job.add_done_callback(forget)
 
     def _kick(self, task_id):
         if not self.closing and (task_id not in self.workers or self.workers[task_id].done()):
@@ -251,6 +329,8 @@ class Gateway:
             elif cmd == '/model':
                 task = self._target(row)
                 await self._model(row, task, arg)
+            elif cmd == '/q':
+                raise ValueError('Use /q <text> to queue a message after the running turn.')
             else:
                 raise ValueError('Unknown command. Use /tasks, /new, /task, /model, /stop, /close or /title.')
         except ValueError as exc:
@@ -299,6 +379,8 @@ class Gateway:
         active, queued = self.storage.stop(row['id'], task_id, close)
         targets = [task_id] if task else [t['id'] for t in self.storage.tasks(row['conversation_id'], True)]
         jobs = [jobs[t] for t in targets for jobs in (self.workers, self.title_jobs) if t in jobs]
+        jobs += [job for t in targets for job in self.steer_jobs.get(t, ())]
+        jobs += [job for t in targets for job in self.notice_jobs.get(t, ())]
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
@@ -402,9 +484,9 @@ class Gateway:
         completed = False
         current_deltas = False
         try:
-            prompt = self.storage.prepare_prompt(turn, row['text'])
+            prompt = self.storage.prepare_prompt(turn, self.storage.input_text(row['id']))
             if recovering and turn['resume_id']:
-                prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{prompt}"
+                prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{prompt}" + self.storage.recovery_inputs(turn['id'])
             if recovering:
                 await self._send(row, f"Service restarted; recovering task {turn['task_id']} (attempt {turn['recovery_count']}/{self.max_recoveries}).", turn['task_id'])
             executor = self.executors.get(turn["executor"])
@@ -420,10 +502,12 @@ class Gateway:
                         for event in record.events:
                             data = event.data
                             if event.kind == "text_delta":
-                                text += data["text"]
+                                text = data['text'] if data.get('replace') else text + data['text']
                                 current_deltas = True
                             elif event.kind == "message":
-                                if not current_deltas and data["text"]:
+                                if data.get('replace'):
+                                    text = data['text']
+                                elif not current_deltas and data["text"]:
                                     text += data["text"]
                                 current_deltas = False
                             elif event.kind == "tool_started":
@@ -438,11 +522,15 @@ class Gateway:
                             elif event.kind == "turn_completed":
                                 completed = data["status"] == "completed"
                                 # Result is the authoritative final answer (no duplicated deltas).
-                                text = data.get("text") or text
+                                # Replay also includes durable complete parts from
+                                # earlier attempts, which the new process cannot know.
+                                saved = self.storage.stored_result(turn['id'])
+                                text = saved[0] if saved is not None else data.get('text') or text
                                 tool = ""
                         reply.update(text, tool)
 
             consumer = asyncio.create_task(consume())
+            self.active_runs[turn['task_id']] = (turn, executor)
             try:
                 await asyncio.shield(consumer)
             except asyncio.CancelledError:
@@ -451,6 +539,9 @@ class Gateway:
                 await executor.cancel(turn["id"])
                 await consumer
                 raise
+            self.active_runs.pop(turn['task_id'], None)
+            if deliveries := self.steer_jobs.get(turn['task_id']):
+                await asyncio.gather(*list(deliveries))
             if self.closing:
                 return  # Exit/error during shutdown is recoverable, not terminal.
             if not completed and error is None:
@@ -473,6 +564,7 @@ class Gateway:
             self.storage.finish(turn["id"], "failed", str(exc))
             await self._send(row, f"Task {turn['task_id']} failed: {exc}", turn['task_id'])
         finally:
+            self.active_runs.pop(turn['task_id'], None)
             typing.cancel()
             await asyncio.gather(typing, return_exceptions=True)
             await reply.cancel()
@@ -540,7 +632,9 @@ class Gateway:
 
     async def shutdown(self):
         self.begin_shutdown()
-        jobs = [*self.workers.values(), *self.title_jobs.values()]
+        jobs = [*self.workers.values(), *self.title_jobs.values(),
+                *(job for jobs in self.steer_jobs.values() for job in jobs),
+                *(job for jobs in self.notice_jobs.values() for job in jobs)]
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)

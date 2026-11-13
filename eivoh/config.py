@@ -6,6 +6,31 @@ import shlex
 from .speech import provider_from_env
 
 
+def validate_codex_args(args):
+    """Options supported by Eivoh's local stdio app-server, not exec options."""
+    owned = {'exec', 'resume', 'app-server', '--listen', '--stdio', '--json', '-C', '--cd', '--model', '-m'}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        flag, equals, value = arg.partition('=')
+        if flag in owned or arg.startswith('-m'):
+            raise ValueError('EIVOH_CODEX_ARGS contains an adapter-owned argument')
+        if arg == '--strict-config':
+            index += 1
+            continue
+        if flag not in {'-c', '--config', '--enable', '--disable'}:
+            raise ValueError(f'EIVOH_CODEX_ARGS now configures app-server; option {flag!r} is not supported. '
+                             'Migrate exec settings to -c/--config, --enable, --disable or --strict-config.')
+        if not equals:
+            index += 1
+            value = args[index] if index < len(args) else ''
+        if not value or value.startswith('-'):
+            raise ValueError(f'EIVOH_CODEX_ARGS app-server option {flag} requires a value')
+        if flag in {'-c', '--config'} and ('=' not in value or not value.split('=', 1)[0]):
+            raise ValueError(f'EIVOH_CODEX_ARGS app-server option {flag} requires key=value')
+        index += 1
+
+
 @dataclass(frozen=True)
 class Config:
     telegram_token: str
@@ -41,7 +66,7 @@ class Config:
             claude_args = tuple(shlex.split(os.environ.get("EIVOH_CLAUDE_ARGS", "")))
         except ValueError as exc:
             raise ValueError("Invalid quoting in EIVOH_CLAUDE_ARGS") from exc
-        owned = {"--resume", "-p", "--print", "--output-format", "--input-format", "--permission-mode", "--model"}
+        owned = {"--resume", "-p", "--print", "--output-format", "--input-format", "--permission-mode", "--model", "--replay-user-messages"}
         for arg in claude_args:
             if arg.split("=", 1)[0] in owned or arg.startswith("-p"):
                 raise ValueError("EIVOH_CLAUDE_ARGS contains an adapter-owned flag")
@@ -49,9 +74,7 @@ class Config:
             codex_args = tuple(shlex.split(os.environ.get("EIVOH_CODEX_ARGS", "")))
         except ValueError as exc:
             raise ValueError("Invalid quoting in EIVOH_CODEX_ARGS") from exc
-        for arg in codex_args:
-            if arg.split("=", 1)[0] in {"exec", "resume", "--json", "-C", "--cd", "--model", "-m"} or arg.startswith("-m"):
-                raise ValueError("EIVOH_CODEX_ARGS contains an adapter-owned argument")
+        validate_codex_args(codex_args)
         default_executor = os.environ.get("EIVOH_DEFAULT_EXECUTOR", "claude").strip().lower()
         if default_executor not in {"claude", "codex"}:
             raise ValueError("EIVOH_DEFAULT_EXECUTOR must be claude or codex")

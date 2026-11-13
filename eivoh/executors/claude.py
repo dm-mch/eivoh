@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import uuid
 
 from .base import Event, Record
 from .cli import CliExecutor, ProcessTree, process_table  # noqa: F401  (re-exported)
@@ -34,11 +35,14 @@ def _parse_line(line: str) -> Record:
                 add("tool_started", **event["content_block"])
     elif kind in {"assistant", "user"}:
         message = raw.get("message", {})
+        content = message.get('content', [])
+        if isinstance(content, str):
+            content = [{'type': 'text', 'text': content}]
         if kind == "assistant" and not raw.get("parent_tool_use_id"):
-            add("message", text="".join(b.get("text", "") for b in message.get("content", []) if b.get("type") == "text"),
+            add("message", text="".join(b.get("text", "") for b in content if b.get("type") == "text"),
                 message_id=message.get("id"), observed_model=message.get("model"),
                 observed_model_source="assistant.message")
-        for block in message.get("content", []):
+        for block in content:
             if block.get("type") == "tool_use":
                 add("tool_started", **block)
             elif block.get("type") == "tool_result":
@@ -87,3 +91,51 @@ class ClaudeExecutor(CliExecutor):
 
     def parser(self):
         return parse_line
+
+
+from .interactive import InteractiveExecutor
+
+
+class ClaudeStreamExecutor(InteractiveExecutor, ClaudeExecutor):
+    """Ordinary Claude tasks with UUID-correlated streamed user input."""
+    # Claude echoes only after its current tool completes, which can take hours.
+    # Lifecycle/stop ends the wait; a healthy long tool is not an ack timeout.
+    ack_timeout = None
+    def command(self, session_id, model=None):
+        return super().command(session_id, model) + ['--input-format', 'stream-json', '--replay-user-messages']
+
+    async def initialize(self, run, prompt, model):
+        await run.write({'type': 'user', 'uuid': str(uuid.uuid4()),
+                         'message': {'role': 'user', 'content': prompt}})
+        run.ready.set()
+
+    async def send_steer(self, run, input_id, text):
+        await run.write({'type': 'user', 'uuid': input_id,
+                         'message': {'role': 'user', 'content': text}})
+
+    async def receive(self, run, raw):
+        if run.terminal:
+            return ()
+        record = parse_line(json.dumps(raw))
+        events = list(record.events)
+        if raw.get('type') == 'user' and raw.get('isReplay') and raw.get('uuid') in run.inputs:
+            run.items[raw['uuid']] = True
+            events.append(Event('input_accepted', {'input_id': raw['uuid']}, raw, raw.get('session_id')))
+        if raw.get('type') == 'result':
+            # A write can cross the result boundary. Claude emits another replay
+            # and result for that input; do not kill it at the preceding result.
+            run.accepting = False
+            if raw.get('result'):
+                result_id = 'claude:' + (raw.get('uuid') or str(uuid.uuid4()))
+                run.answer_parts[result_id] = raw['result']
+            if not raw.get('is_error') and any(input_id not in run.items for input_id in run.inputs):
+                events = [event for event in events if event.kind != 'turn_completed']
+                if raw.get('result'):
+                    events.append(Event('answer_part', {'id': result_id, 'text': raw['result']}, raw, raw.get('session_id')))
+            else:
+                run.terminal = True
+                events = [Event(event.kind, {**event.data, 'text': '\n\n'.join(run.answer_parts.values()),
+                                             'answer_part_ids': list(run.answer_parts)},
+                                event.raw, event.session_id) if event.kind == 'turn_completed' else event
+                          for event in events]
+        return events
