@@ -1,6 +1,6 @@
 # Eivoh development plan
 
-Current stage: V0. No dates are set. The architecture describes the target system; this file describes the order in which it appears and is the only place where the current stage is stated.
+Current stage: V2. V0 and V1 are done (2026-11-13). No dates are set. The architecture describes the target system; this file describes the order in which it appears and is the only place where the current stage is stated.
 
 # How the plan works
 
@@ -21,9 +21,11 @@ State: a Markdown foundation, not a finished service. Tasks are carried out by a
 
 Done when: V1 is built by following these documents; the experience records of that work exist; at least one expectation from a change to the documents has been checked against a later task.
 
+Done (2026-11-13): V1 was built by following these documents, with experience records for each substantial task. The expectation that experience records appear without a reminder was observed in the later V1 and V2 tasks.
+
 # V1. Chat with one executor
 
-State: code built and tested with a fake executor on Python 3.12.3; an opt-in live test with the real Claude CLI passed (turn, resume, cancel during a tool call without orphans). Storage separates tasks from turns and starts at schema migration 1. Recovery, shutdown ordering and per-turn subreaper cleanup have offline regression coverage. The installed Claude CLI probe confirmed the JSONL/session-id format, resume after a hard kill, prompt delivery with stdin closed, subscription login with API-key variables removed, and a Bash tool call in headless `bypassPermissions` mode. Native SIGTERM/SIGINT descendant cleanup, interactive approval/error shapes and persistence of the last message if killed during a write remain unverified. Plugins enabled globally in Claude Code are loaded by the executor unless disabled with an `EIVOH_CLAUDE_ARGS` settings override. Observed once on the installed service (2026-11-13): messages from Telegram are answered, consecutive messages continue one executor session, a service restart in the middle of a turn resumed the turn and it completed, and deployment through the release worktree script worked. `/stop` during a tool call cancelled the turn and left no process in the service's control group. The work on V2 through the chat is not yet observed.
+State: code built and tested with a fake executor on Python 3.12.3; an opt-in live test with the real Claude CLI passed (turn, resume, cancel during a tool call without orphans). Storage separates tasks from turns and starts at schema migration 1. Recovery, shutdown ordering and per-turn subreaper cleanup have offline regression coverage. The installed Claude CLI probe confirmed the JSONL/session-id format, resume after a hard kill, prompt delivery with stdin closed, subscription login with API-key variables removed, and a Bash tool call in headless `bypassPermissions` mode. Native SIGTERM/SIGINT descendant cleanup, interactive approval/error shapes and persistence of the last message if killed during a write remain unverified. Plugins enabled globally in Claude Code are loaded by the executor unless disabled with an `EIVOH_CLAUDE_ARGS` settings override. Observed once on the installed service (2026-11-13): messages from Telegram are answered, consecutive messages continue one executor session, a service restart in the middle of a turn resumed the turn and it completed, and deployment through the release worktree script worked. `/stop` during a tool call cancelled the turn and left no process in the service's control group. Work on V2 has gone through the chat: voice messages were built, deployed and checked from it.
 
 Goal: the owner sends a message in Telegram and a real coding CLI does the task; from this point the work on Eivoh itself goes through this chat.
 
@@ -50,6 +52,8 @@ Confirm by test before relying on it:
 * Headless permission settings that never block waiting for an answer.
 
 Done when: the work on V2 is carried out through the chat; a restart of the service in the middle of a task loses neither the message nor the task; `/stop` ends the task and leaves no orphaned processes; every task has its raw events in storage.
+
+Done (2026-11-13): each condition was observed once on the installed service, as described in the state above; every turn so far has its raw events in storage. The unverified points in the state stay open and are checked when they matter.
 
 # V2. Second executor and a comfortable chat
 
