@@ -17,6 +17,7 @@ See [ROADMAP.md](ROADMAP.md) for the current stage and what already works. The c
 
 # Work and verification
 
+* Personal skills, such as how to run other executors as subagents for coding or review, are in private/skills/; see [private/README.md](private/README.md). Check a skill against the installed tool before relying on it.
 * Make minimal, related changes. Build on what exists; do not add a stack, module, algorithm or dependency as if it were already approved. Label a proposal as a proposal.
 * Verify the result with the means that are actually available. For Markdown, check that the instructions are clear, the documents are consistent, the links work and no capabilities are invented. For code, use the existing checks relevant to the task. Report what was done and what remains unverified.
 * Ordinary checks of quality, correctness and safety are allowed. Do not introduce mandatory A/B tests, baselines or comparative experiments as a stage of evolution; the procedure is described in EVOLUTION.md.
