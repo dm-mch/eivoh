@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from eivoh.executors.claude import ClaudeExecutor, parse_line, process_table
+from eivoh.config import Config
 
 
 def test_real_sanitized_stream():
@@ -43,6 +44,26 @@ async def test_environment_stdin_and_resume(rig, monkeypatch):
     assert '--bare' not in logs[0]['args']
     with pytest.raises(ValueError):
         executor.resume(102, '--bad', 'x')
+
+
+async def test_config_args_reach_fake_executor_on_start_and_resume(rig, monkeypatch):
+    _, _, executor, _, path = rig
+    settings = '{"enabledPlugins":{"example-plugin@example-marketplace":false}}'
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    monkeypatch.setenv('EIVOH_WORKDIR', str(path))
+    monkeypatch.setenv('EIVOH_CLAUDE_ARGS', f"--settings '{settings}'")
+    config = Config.from_env()
+    adapter = ClaudeExecutor(config.workdir, executor.binary, model='test-model',
+                             extra_args=config.claude_args, grace=0.1)
+    records = [r async for r in adapter.start(100, 'first')]
+    sid = next(e.session_id for r in records for e in r.events if e.kind == 'session_started')
+    _ = [r async for r in adapter.resume(101, sid, 'second')]
+    logs = [json.loads(line) for line in (path / 'prompts.jsonl').read_text().splitlines()]
+    built_in = ['-p', '--output-format', 'stream-json', '--verbose',
+                '--include-partial-messages', '--permission-mode', 'bypassPermissions']
+    assert logs[0]['args'] == built_in + ['--model', 'test-model', '--settings', settings]
+    assert logs[1]['args'] == built_in + ['--resume', sid, '--model', 'test-model', '--settings', settings]
 
 
 @pytest.mark.parametrize('prompt', ['crash', 'complete-with-child'])

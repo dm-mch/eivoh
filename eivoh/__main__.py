@@ -13,7 +13,8 @@ from .storage import Storage
 async def serve(config: Config):
     os.umask(0o077)
     storage = Storage(config.state_dir / "eivoh.sqlite3")
-    executor = ClaudeExecutor(config.workdir, config.claude_bin, config.claude_model, config.permission_mode)
+    executor = ClaudeExecutor(config.workdir, config.claude_bin, config.claude_model,
+                              config.permission_mode, extra_args=config.claude_args)
     channel = TelegramChannel(config.telegram_token, config.owner_id)
     gateway = Gateway(storage, executor, {"telegram": channel})
     stopping = asyncio.Event()

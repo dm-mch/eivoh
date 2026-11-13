@@ -59,6 +59,7 @@ EIVOH_WORKDIR=/home/your-user/src/eivoh
 # EIVOH_CLAUDE_MODEL=haiku
 # EIVOH_CLAUDE_PERMISSION_MODE=bypassPermissions
 # EIVOH_CLAUDE_BIN=claude
+# EIVOH_CLAUDE_ARGS=
 ```
 
 Set `EIVOH_WORKDIR` explicitly to the working tree the executor should edit,
@@ -68,6 +69,21 @@ state in `~/.local/state/eivoh`, no model override, permission mode
 The default permission mode allows tools without interactive approval; other
 modes' headless behavior is unverified. Eivoh removes inherited `CLAUDE*` and
 `ANTHROPIC*` variables and does not use bare mode or supply an API key.
+
+`EIVOH_CLAUDE_ARGS` is empty by default. It is split with Python's `shlex.split`
+(shell-style quoting, without shell expansion) and appended after all built-in
+Claude arguments on both start and resume. The adapter owns `--resume`,
+`-p`/`--print`, `--output-format`, `--input-format` and `--permission-mode`;
+these flags are rejected here, including `--flag=value` forms.
+Claude Code plugins enabled globally also load in the executor. To disable a
+plugin, pass a settings override, for example with this shell command:
+
+```sh
+export EIVOH_CLAUDE_ARGS="--settings '{\"enabledPlugins\":{\"example-plugin@example-marketplace\":false}}'"
+```
+
+For the systemd environment file, use the same quoted value without `export`.
+
 Only the numeric owner in a private chat is admitted. Use one instance and a
 dedicated token; multi-instance locking belongs to V2.
 

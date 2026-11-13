@@ -136,12 +136,13 @@ class ProcessTree:
 
 class ClaudeExecutor:
     def __init__(self, workdir: Path, binary="claude", model=None,
-                 permission_mode="bypassPermissions", grace=0.5):
+                 permission_mode="bypassPermissions", grace=0.5, extra_args=()):
         self.workdir = workdir
         self.binary = str(binary)
         self.model = model
         self.permission_mode = permission_mode
         self.grace = grace
+        self.extra_args = tuple(extra_args)
         self.running: dict[int, ProcessTree] = {}
         self.starting: dict[int, asyncio.Task] = {}
 
@@ -162,6 +163,7 @@ class ClaudeExecutor:
             args += ["--resume", session_id]
         if self.model:
             args += ["--model", self.model]
+        args.extend(self.extra_args)
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC"))}
         async def spawn():
             supervisor = Path(__file__).with_name("supervisor.py")

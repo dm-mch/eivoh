@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shlex
 
 
 @dataclass(frozen=True)
@@ -12,6 +13,7 @@ class Config:
     claude_model: str | None = None
     permission_mode: str = "bypassPermissions"
     claude_bin: str = "claude"
+    claude_args: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -27,7 +29,15 @@ class Config:
         mode = os.environ.get("EIVOH_CLAUDE_PERMISSION_MODE", "bypassPermissions")
         if mode not in {"acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}:
             raise ValueError("Unknown EIVOH_CLAUDE_PERMISSION_MODE")
+        try:
+            claude_args = tuple(shlex.split(os.environ.get("EIVOH_CLAUDE_ARGS", "")))
+        except ValueError as exc:
+            raise ValueError("Invalid quoting in EIVOH_CLAUDE_ARGS") from exc
+        owned = {"--resume", "-p", "--print", "--output-format", "--input-format", "--permission-mode"}
+        for arg in claude_args:
+            if arg.split("=", 1)[0] in owned or arg.startswith("-p"):
+                raise ValueError("EIVOH_CLAUDE_ARGS contains an adapter-owned flag")
         return cls(token, int(owner),
                    Path(os.environ.get("EIVOH_STATE_DIR", "~/.local/state/eivoh")).expanduser().resolve(),
                    workdir, os.environ.get("EIVOH_CLAUDE_MODEL") or None,
-                   mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"))
+                   mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"), claude_args)
