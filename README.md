@@ -129,7 +129,9 @@ The switch reply reports the number of included turns. With no active task,
 selection creates one. Telegram's `/new`, `/model` and `/stop` menu is registered
 once at polling startup, best-effort. Migration, model selection, CLI arguments,
 session reuse, transcript handoff, recovery and menu registration are tested
-offline with fakes; live use of `/model` remains unverified.
+offline with fakes. In live use, selection by name and number and a transcript
+handoff in both directions were observed once; handoff recovery after a restart
+remains unverified.
 
 Only the numeric owner in a private chat is admitted. Use one instance and a
 dedicated token; multi-instance locking belongs to V2.
