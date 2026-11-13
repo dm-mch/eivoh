@@ -47,4 +47,4 @@ These are fragments of code that were studied, not ready integrations in Eivoh. 
 
 # Open decisions
 
-How processes and background work are organised on the VM, storage and recovery, linking of channels, sources for tracking limits, compatibility of CLIs and providers. Python and SQLite remain options, not an approved stack.
+How processes and background work are organised on the VM, storage and recovery, linking of channels, sources for tracking limits, compatibility of CLIs and providers. Python 3.12, SQLite, asyncio and python-telegram-bot are confirmed for V1; see [ROADMAP.md](ROADMAP.md).
