@@ -106,6 +106,7 @@ Build:
 * A calibration report built from the records: forecasts against observed results, by task type, executor and model.
 * Choice of executor, model and skills for a task on the basis of experience.
 * Tracking of subscription limits and costs, with unknown consumption marked as unknown.
+* Proposal (2026-11-13, accepted by the owner as a direction, not yet designed): nested subagents through Eivoh. An executor asks Eivoh to start a subagent on any available model, Claude or Codex, for example with an `eivoh spawn --model <model> <task>` command. The subagent is a child task with its own executor session and raw events in storage, receives the same capability, and can start its own subagents. A depth limit and a budget for the whole task tree come from limit tracking; cancelling a task cancels its subtree. Until then, executors that start other CLIs directly do so outside Eivoh's journal and limits; `/stop` still ends them as descendants of the executor process.
 
 Reuse: a ready-made model without fine-tuning performs these roles; a fast typed-decision model such as Jev is a candidate to evaluate when the stage starts.
 
