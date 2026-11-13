@@ -16,28 +16,48 @@ CLAUDE_MODELS = [
 ]
 
 
+def codex_models():
+    path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "models_cache.json"
+    try:
+        data = json.loads(path.read_text())
+        entries = data.get('models', []) if isinstance(data, dict) else []
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def effort_levels(executor, model=None):
+    if executor == 'claude':
+        return ['low', 'medium', 'high', 'xhigh', 'max']
+    if executor != 'codex':
+        return []
+    if model:
+        for entry in codex_models():
+            if entry.get('slug') == model:
+                levels = entry.get('supported_reasoning_levels')
+                if isinstance(levels, list):
+                    return list(dict.fromkeys(level['effort'] for level in levels
+                        if isinstance(level, dict) and isinstance(level.get('effort'), str)
+                        and level['effort'].isascii() and level['effort'].isalpha()))
+                break
+    return ['low', 'medium', 'high', 'xhigh']
+
+
 def catalog() -> dict[str, list[tuple[str, str]]]:
     claude = list(CLAUDE_MODELS)
     if "EIVOH_CLAUDE_MODELS" in os.environ:
         claude = [(name, "Configured model") for name in dict.fromkeys(
             value.strip() for value in os.environ["EIVOH_CLAUDE_MODELS"].split(",") if value.strip())]
-    path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser() / "models_cache.json"
     codex = []
-    try:
-        data = json.loads(path.read_text())
-        entries = data.get("models", []) if isinstance(data, dict) else []
-        if isinstance(entries, list):
-            seen = set()
-            for entry in entries:
-                if not isinstance(entry, dict) or entry.get("visibility") != "list":
-                    continue
-                slug = entry.get("slug")
-                if isinstance(slug, str) and slug.strip() and slug not in seen:
-                    description = entry.get("description")
-                    codex.append((slug, description if isinstance(description, str) else ""))
-                    seen.add(slug)
-    except (OSError, ValueError):
-        pass
+    seen = set()
+    for entry in codex_models():
+        if entry.get("visibility") != "list":
+            continue
+        slug = entry.get("slug")
+        if isinstance(slug, str) and slug.strip() and slug not in seen:
+            description = entry.get("description")
+            codex.append((slug, description if isinstance(description, str) else ""))
+            seen.add(slug)
     return {"claude": claude, "codex": codex}
 
 

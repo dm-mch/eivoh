@@ -44,7 +44,7 @@ class InteractiveExecutor(CliExecutor):
         super().__init__(*args, **kwargs)
         self.runs = {}
 
-    async def initialize(self, run, prompt, model):
+    async def initialize(self, run, prompt, model, effort=None):
         raise NotImplementedError
 
     async def receive(self, run, raw):
@@ -86,10 +86,10 @@ class InteractiveExecutor(CliExecutor):
         except (BrokenPipeError, ConnectionResetError):
             return SteerResult('unknown' if written else 'not_sent', 'Transport closed')
 
-    async def _turn(self, run_id, prompt, session_id=None, model=None):
+    async def _turn(self, run_id, prompt, session_id=None, model=None, effort=None):
         if run_id in self.running or run_id in self.starting:
             raise RuntimeError('Run already running')
-        args = self.command(session_id, model)
+        args = self.command(session_id, model, effort)
         async def spawn():
             supervisor = Path(__file__).with_name('supervisor.py')
             proc = await asyncio.create_subprocess_exec(sys.executable, str(supervisor), str(self.grace), *args,
@@ -117,7 +117,7 @@ class InteractiveExecutor(CliExecutor):
         run = Run(run_id, proc, session_id)
         self.runs[run_id] = run
         queue = asyncio.Queue()
-        await queue.put(Record(None, {'executor': type(self).__name__, **self.model_metadata(model),
+        await queue.put(Record(None, {'executor': type(self).__name__, **self.model_metadata(model, effort),
                                      'argv': args, 'cwd': str(self.workdir)}, stream='meta'))
 
         async def read(pipe, stream):
@@ -148,7 +148,7 @@ class InteractiveExecutor(CliExecutor):
         async def initialize():
             try:
                 async with asyncio.timeout(self.startup_timeout):
-                    await self.initialize(run, prompt, model)
+                    await self.initialize(run, prompt, model, effort)
             except Exception as exc:
                 await queue.put(Record(None, None, (Event('error', {'message': str(exc) or 'Executor initialization timed out'}, None),)))
                 await tree.cleanup(self.grace)

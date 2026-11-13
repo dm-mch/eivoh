@@ -81,7 +81,7 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
 def test_schema_version_reopen_and_future_rejected(tmp_path):
     path = tmp_path / 'version.db'
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
     store.journal(inbound(1, 'retained'))
     store.close()
     store = Storage(path)
@@ -121,24 +121,29 @@ def test_v6_migration_adds_message_indexes_without_changing_journal(tmp_path, mo
     with monkeypatch.context() as patch:
         patch.setattr(module, 'MIGRATIONS', module.MIGRATIONS[:6])
         store = Storage(path)
-        store.journal(inbound(1, 'retained'))
+        store.db.execute("INSERT INTO conversation(id,channel,chat_id) VALUES (1,'fake','10')")
+        store.db.execute("INSERT INTO task(id,conversation_id,executor) VALUES (1,1,'claude')")
+        store.db.execute("UPDATE conversation SET active_task_id=1 WHERE id=1")
+        store.db.execute("INSERT INTO inbound(id,conversation_id,channel,chat_id,user_id,message_id,text) VALUES (1,1,'fake','10','1','1','retained')")
+        store.db.execute("INSERT INTO turn(id,inbound_id,conversation_id,task_id) VALUES (1,1,1,1)")
         row = store.prepare_delivery('telegram', '10', 'turn:1', '0', {'kind': 'text', 'text': 'Working'}, 1, 1)
         attempt = store.begin_delivery(row['id'], 'send', json.loads(row['payload']))
         store.delivery_outcome(row['id'], attempt, 'sent', '10')
         tables = [row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        columns = {table: ','.join(row['name'] for row in store.db.execute(f'PRAGMA table_info({table})')) for table in tables}
         before = {table: [tuple(row) for row in store.db.execute(f'SELECT * FROM {table} ORDER BY rowid')] for table in tables}
         store.close()
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
     for table in tables:
-        assert [tuple(row) for row in store.db.execute(f'SELECT * FROM {table} ORDER BY rowid')] == before[table]
+        assert [tuple(row) for row in store.db.execute(f'SELECT {columns[table]} FROM {table} ORDER BY rowid')] == before[table]
     for table in ('inbound', 'delivery'):
         indexes = {row['name'] for row in store.db.execute(f'PRAGMA index_list({table})')}
         assert f'{table}_message_number' in indexes
     assert not store.db.execute('PRAGMA foreign_key_check').fetchall()
     store.close()
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
     store.close()
 
 
@@ -191,7 +196,7 @@ def test_v1_upgrades_in_place(tmp_path):
                    "VALUES (1,1,1,1,'running','old-session')")
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
         task = store.active_task(1)
         assert task['model'] is None and task['session_id'] == 'old-session'
         turn, recovering = store.claim(1, 3)

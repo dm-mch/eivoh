@@ -101,7 +101,7 @@ async def test_new_codex_task_runs_and_resumes(codex_rig):
     await gateway.receive(inbound(2, 'hello'))
     await gateway.receive(inbound(3, 'again'))
     await gateway.idle()
-    assert any('New task 1' in text and 'codex/default' in text for _, text in channel.sent)
+    assert any('New task 1' in text and 'codex / default · default' in text for _, text in channel.sent)
     first, second = storage.turn_for(2), storage.turn_for(3)
     assert first['status'] == second['status'] == 'completed'
     task = storage.db.execute('SELECT * FROM task WHERE id=?', (first['task_id'],)).fetchone()
@@ -283,7 +283,7 @@ async def test_handoff_survives_repeated_restart_after_session_started(codex_rig
         def __init__(self, store):
             self.store, self.stopped = store, asyncio.Event()
 
-        async def start(self, run_id, prompt, model=None):
+        async def start(self, run_id, prompt, model=None, effort=None):
             # The assembled input must be durable before the executor is called.
             journal = self.store.db.execute(
                 "SELECT payload FROM raw_event WHERE turn_id=? AND stream='meta' ORDER BY sequence", (run_id,)).fetchall()
@@ -292,9 +292,9 @@ async def test_handoff_survives_repeated_restart_after_session_started(codex_rig
             yield session  # Crash window: session exists, prompt not accepted.
             await self.stopped.wait()
 
-        def resume(self, run_id, session_id, prompt, model=None):
+        def resume(self, run_id, session_id, prompt, model=None, effort=None):
             assert session_id == 'handoff-session'
-            return self.start(run_id, prompt, model)
+            return self.start(run_id, prompt, model, effort=effort)
 
         async def cancel(self, run_id):
             self.stopped.set()

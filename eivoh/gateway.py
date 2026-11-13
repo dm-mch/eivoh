@@ -7,7 +7,7 @@ import json
 
 from .channels.base import Channel, Inbound
 from .executors.base import Executor
-from .models import catalog, resolve
+from .models import catalog, resolve, effort_levels
 from .storage import Storage, command
 from . import titles
 from .attachments import AttachmentError, output_instructions, snapshot_outputs, visible_text
@@ -164,7 +164,7 @@ class Gateway:
                 return True
             turn = self.storage.turn_for(row['id'])
             if turn is None:
-                await self._command(row)
+                await self._command(row, button=message.button)
             else:
                 worker = self.workers.get(turn['task_id'])
                 busy = worker is not None and not worker.done()
@@ -179,8 +179,8 @@ class Gateway:
                 elif busy and row['id'] not in reserved:
                     active = self.active_runs.get(turn['task_id'])
                     task = self.storage.task(row['conversation_id'], turn['task_id'])
-                    if active and row['preparation'] != 'pending' and (active[0]['executor'], active[0]['model']) != (task['executor'], task['model']):
-                        self._notice(row, f"Queued for task {turn['task_id']} after earlier messages, using the selected model.", turn['task_id'], 'admission')
+                    if active and row['preparation'] != 'pending' and any(active[0][key] != task[key] for key in ('executor', 'model', 'effort')):
+                        self._notice(row, f"Queued for task {turn['task_id']} after earlier messages, using the selected model and effort.", turn['task_id'], 'admission')
                     else:
                         self._react(row, '✍', turn['task_id'])
             for reply in self.replies:
@@ -475,9 +475,22 @@ class Gateway:
                          ([f'queued {queued}'] if queued else [])) or 'idle'
 
     def _describe(self, task):
-        return f"{task['id']} · {literal(task_title(task))} — {task['executor']}/{task['model'] or 'default'} — {self._state(task)}"
+        return f"{task['id']} · {literal(task_title(task))} — {self._mode(task)} — {self._state(task)}"
 
-    async def _command(self, row):
+    def _mode(self, task):
+        name = task['executor'] if task else self.default_executor
+        model = task['model'] if task else None
+        effort = task['effort'] if task else None
+        return f"{name} / {model or 'default'} · {effort or 'default'}"
+
+    def _settings_buttons(self, task):
+        model, effort = self._mode(task).rsplit(' · ', 1)
+        return [[(model, f"/model #{task['id']}"), (f'Effort: {effort}', f"/effort #{task['id']}")]]
+
+    def _next_launch(self, task):
+        return ' Applies from the next turn launch; the running turn keeps its settings.' if 'running' in self._state(task) else ''
+
+    async def _command(self, row, *, button=False):
         cmd = command(row['text'])
         parts = row['text'].split(maxsplit=1)
         arg = parts[1].strip() if len(parts) > 1 else ''
@@ -485,12 +498,12 @@ class Gateway:
         try:
             if cmd == '/new':
                 words = arg.split(maxsplit=1)
-                name = self.default_executor
+                name = None
                 if words and words[0].lower() in self.executors:
                     name = words[0].lower()
                     arg = words[1] if len(words) > 1 else ''
                 task = self.storage.new_task(row['id'], name, ' '.join(arg.split()) or None)
-                await self._send(row, f"New task {self._describe(task)}.", task['id'])
+                await self._send(row, f"New task {self._describe(task)}.", task['id'], buttons=self._settings_buttons(task))
             elif cmd == '/tasks' or (cmd == '/task' and not arg):
                 await self._tasks(row, arg)
             elif cmd == '/task':
@@ -502,7 +515,7 @@ class Gateway:
                     lines.append('Last message: ' + snippet(strip_voice(user)))
                 if answer:
                     lines.append('Last answer: ' + snippet(answer))
-                await self._send(row, '\n'.join(lines), task['id'])
+                await self._send(row, '\n'.join(lines), task['id'], buttons=self._settings_buttons(task))
             elif cmd in {'/stop', '/close'}:
                 if cmd == '/stop' and arg == 'all':
                     task = None
@@ -519,13 +532,22 @@ class Gateway:
                     raise ValueError('Use /title <text>.')
                 self.storage.title_task(row['id'], task['id'], ' '.join(arg.split()))
                 await self._send(row, f"Task {task['id']} renamed.", task['id'])
-            elif cmd == '/model':
-                task = self._target(row)
-                await self._model(row, task, arg)
+            elif cmd in {'/model', '/effort'}:
+                words = arg.split(maxsplit=1)
+                new_task = bool(words and words[0] == '#new')
+                if words and words[0].startswith('#'):
+                    task = None if new_task else self._target(row, words[0][1:])
+                    arg = words[1] if len(words) > 1 else ''
+                elif button or row['message_id'].startswith('cb:'):
+                    raise ValueError('This settings button has no task target. Open /model or /effort again.')
+                else:
+                    task = self._target(row)
+                handler = self._model if cmd == '/model' else self._effort
+                await handler(row, task, arg, new_task=new_task)
             elif cmd == '/q':
                 raise ValueError('Use /q <text> to queue a message after the running turn.')
             else:
-                raise ValueError('Unknown command. Use /tasks, /new, /task, /model, /stop, /close or /title.')
+                raise ValueError('Unknown command. Use /tasks, /new, /task, /model, /effort, /stop, /close or /title.')
         except ValueError as exc:
             self.storage.finish_command(row['id'])
             await self._send(row, str(exc), task['id'] if task else None)
@@ -548,7 +570,7 @@ class Gateway:
         for task in shown:
             marker = '▶' if current and current['id'] == task['id'] else '·'
             state = 'closed' if task['status'] == 'closed' else self._state(task)
-            lines.append(f"\n{marker} {task['id']} · {literal(task_title(task))}\n    {task['executor']}/{task['model'] or 'default'}"
+            lines.append(f"\n{marker} {task['id']} · {literal(task_title(task))}\n    {self._mode(task)}"
                          f" · {state} · {relative_time(task['last_active'])}{lifetime(task)}")
             buttons.append([(f"{task['id']} · {task_title(task)}", f"/task {task['id']}")])
         if not shown:
@@ -569,6 +591,7 @@ class Gateway:
 
     async def _stop(self, row, task, close=False):
         task_id = task['id'] if task else None
+        current = self.storage.active_task(row['conversation_id']) if close else None
         active, queued = self.storage.stop(row['id'], task_id, close)
         targets = [task_id] if task else [t['id'] for t in self.storage.tasks(row['conversation_id'], True)]
         jobs = [jobs[t] for t in targets for jobs in (self.workers, self.title_jobs) if t in jobs]
@@ -584,6 +607,9 @@ class Gateway:
         for run_id, _ in active:
             await self._cancel_run(run_id)
         description = f"Closed task {task_id}." if close else f"Stopped task {task_id}." if task else "Stopped all tasks."
+        if current and current['id'] == task_id:
+            current = self.storage.active_task(row['conversation_id'])
+            description += f" Current task {self._describe(current)}." if current else ' No current task.'
         await self._send(row, f"{description} Cancelled {queued} queued message(s).", task_id)
 
     async def _work(self, task_id):
@@ -640,41 +666,108 @@ class Gateway:
             finally:
                 release()
 
-    async def _model(self, row, task, arg):
-        conv = row['conversation_id']
-        if not arg:
-            name = task['executor'] if task else self.default_executor
-            model = task['model'] if task else None
-            choices = catalog()
-            self.model_catalogs[conv] = choices
-            lines = [f"Model: {name} / {model or 'default'}."]
+    async def _model_menu(self, row, task, name=None, page=1):
+        target = f"#{task['id']}" if task else '#new'
+        prefix = f'/model {target}'
+        choices = {executor: models for executor, models in catalog().items() if executor in self.executors}
+        buttons = []
+        lines = [f"Model: {self._mode(task)}."]
+        if name is not None:
+            choices = {name: choices.get(name, [])}
+            models = choices[name]
+            pages = max(1, (len(models) + 7) // 8)
+            page = min(page, pages)
+            start = (page - 1) * 8
+            lines.append(f"\n{name}, page {page}/{pages}:")
+            for number, (model, description) in enumerate(models[start:start + 8], start + 1):
+                lines.append(f"{number}. {model}" + (f" — {description}" if description else ''))
+                data = f'{prefix} {name} {model}'
+                if len(data.encode('utf-8')) <= 64:
+                    buttons.append([(model, data)])
+            if not models:
+                lines.append('No models available.')
+            navigation = []
+            if page > 1:
+                navigation.append(('‹', f'{prefix} {name} page {page - 1}'))
+            if page < pages:
+                navigation.append(('›', f'{prefix} {name} page {page + 1}'))
+            if navigation:
+                buttons.append(navigation)
+        else:
             number = 0
             for executor, models in choices.items():
                 lines.append(f"\n{executor}:")
-                for model_id, description in models:
+                for model, description in models:
                     number += 1
-                    lines.append(f"{number}. {model_id}" + (f" — {description}" if description else ''))
+                    lines.append(f"{number}. {model}" + (f" — {description}" if description else ''))
                 if not models:
                     lines.append('No models available.')
-            lines.append('\nChoose with /model <name or number>.')
-            reply = '\n'.join(lines)
-            self.storage.finish_command(row['id'])
-        else:
-            choices = None
-            if arg.isdecimal():
-                choices = self.model_catalogs.get(conv)
-                if choices is None:
-                    raise ValueError('Use /model to list numbered choices first (also after a restart).')
-            name, model = resolve(arg, choices)
+            buttons = [[(executor, f'{prefix} {executor}')] for executor in self.executors]
+            buttons.append([(f"Effort: {task['effort'] or 'default'}" if task else 'Effort: default', f'/effort {target}')])
+        self.model_catalogs[row['conversation_id']] = choices
+        lines.append(f'\nChoose with {prefix} <name or number>.')
+        if task is None:
+            lines.append('Selecting creates a new task with executor defaults.')
+        self.storage.finish_command(row['id'])
+        await self._send(row, '\n'.join(lines), task['id'] if task else None, buttons=buttons)
+
+    async def _model(self, row, task, arg, *, new_task=False):
+        parts = arg.split(maxsplit=1)
+        name = parts[0].lower() if parts else None
+        if not arg:
+            return await self._model_menu(row, task)
+        choices = None
+        if name in self.executors or name in catalog():
             if name not in self.executors:
                 raise ValueError(f'Executor {name} is not configured.')
-            task, _ = self.storage.set_model(row['id'], name, model, task['id'] if task else None)
-            _, count, truncated = self.storage.missed_transcript(task['id'], name, row['id'])
-            reply = f"Model: {name} / {model}. "
-            reply += (f"Context will be passed as a transcript of {count} earlier turns." if count else 'Context kept (same session).')
-            if truncated:
-                reply += ' Transcript truncated: older turns or parts of the newest turn omitted.'
-        await self._send(row, reply, task['id'] if task else None)
+            if len(parts) == 1:
+                return await self._model_menu(row, task, name)
+            tail = parts[1].split()
+            if tail[0] == 'page' and len(tail) > 1:
+                if len(tail) != 2 or not tail[1].isdecimal() or int(tail[1]) < 1:
+                    raise ValueError('Use /model <executor> page <positive number>.')
+                return await self._model_menu(row, task, name, int(tail[1]))
+            choices = {name: catalog().get(name, [])}
+            arg = parts[1]
+        elif arg.isdecimal():
+            choices = self.model_catalogs.get(row['conversation_id'])
+            if choices is None:
+                raise ValueError('Use /model to list numbered choices first (also after a restart).')
+        name, model = resolve(arg, choices)
+        if name not in self.executors:
+            raise ValueError(f'Executor {name} is not configured.')
+        reset = bool(task and task['effort'] and task['effort'] not in effort_levels(name, model))
+        task, _ = self.storage.set_model(row['id'], name, model, task['id'] if task else None,
+                                         reset_effort=reset, new_task=new_task)
+        _, count, truncated = self.storage.missed_transcript(task['id'], name, row['id'])
+        reply = f"Model: {self._mode(task)}. "
+        reply += (f"Context will be passed as a transcript of {count} earlier turns." if count else 'Context kept (same session).')
+        if truncated:
+            reply += ' Transcript truncated: older turns or parts of the newest turn omitted.'
+        if reset:
+            reply += ' Effort reset to default because the selected executor/model does not support it.'
+        reply += self._next_launch(task)
+        await self._send(row, reply, task['id'], buttons=self._settings_buttons(task))
+
+    async def _effort(self, row, task, arg, *, new_task=False):
+        name = task['executor'] if task else self.default_executor
+        levels = effort_levels(name, task['model'] if task else None)
+        prefix = f"/effort #{task['id']}" if task else '/effort #new'
+        if not arg:
+            self.storage.finish_command(row['id'])
+            buttons = [[(level, f'{prefix} {level}')] for level in [*levels, 'default']
+                       if len(f'{prefix} {level}'.encode('utf-8')) <= 64]
+            await self._send(row, f"Effort: {self._mode(task)}.\nSupported: {', '.join([*levels, 'default'])}."
+                             f'\nChoose with {prefix} <level or default>.' +
+                             ('\nSelecting creates a new task with executor defaults.' if task is None else ''),
+                             task['id'] if task else None, buttons=buttons)
+            return
+        if arg != 'default' and arg not in levels:
+            raise ValueError(f"Unsupported effort `{arg}`. Supported: {', '.join([*levels, 'default'])}.")
+        task = self.storage.set_effort(row['id'], None if arg == 'default' else arg, task['id'] if task else None,
+                                      new_task=new_task)
+        await self._send(row, f"Effort: {self._mode(task)}." + self._next_launch(task), task['id'],
+                         buttons=self._settings_buttons(task))
 
     async def _typing(self, channel, chat):
         # Studied reference: nanobot (MIT), nanobot/channels/telegram/runtime.py.
@@ -702,8 +795,8 @@ class Gateway:
             executor = self.executors.get(turn["executor"])
             if executor is None:
                 raise RuntimeError(f"Executor {turn['executor']} is not configured")
-            stream = (executor.resume(turn["id"], turn["resume_id"], prompt, model=turn["model"])
-                      if turn["resume_id"] else executor.start(turn["id"], prompt, model=turn["model"]))
+            stream = (executor.resume(turn["id"], turn["resume_id"], prompt, model=turn["model"], effort=turn["effort"])
+                      if turn["resume_id"] else executor.start(turn["id"], prompt, model=turn["model"], effort=turn["effort"]))
             async def consume():
                 nonlocal text, tool, error, completed, current_deltas
                 async with aclosing(stream):

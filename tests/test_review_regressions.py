@@ -64,7 +64,7 @@ async def test_shutdown_before_executor_exit_stays_recoverable(rig, ending):
     gateway, storage, _, _, _ = rig
 
     class EndingExecutor:
-        async def start(self, run_id, prompt, model=None):
+        async def start(self, run_id, prompt, model=None, effort=None):
             # Signal handler runs before the consumer sees the CLI's exit.
             gateway.begin_shutdown()
             if ending == 'exception':

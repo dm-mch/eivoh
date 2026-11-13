@@ -134,6 +134,10 @@ MIGRATIONS = (
         "CREATE INDEX inbound_message_number ON inbound(channel,chat_id,CAST(message_id AS INTEGER))",
         "CREATE INDEX delivery_message_number ON delivery(channel,chat_id,CAST(message_id AS INTEGER))",
     ),
+    (
+        "ALTER TABLE task ADD COLUMN effort TEXT",
+        "ALTER TABLE turn ADD COLUMN effort TEXT",
+    ),
 )
 
 
@@ -251,7 +255,8 @@ class Storage:
             task = self.task(parent['conversation_id'], parent['task_id'])
             if (parent['status'] != 'running' or child['status'] != 'queued' or child['force_queue'] or
                     self.inbound(inbound_id)['preparation'] != 'ready' or
-                    self.steering(inbound_id) or parent['executor'] != task['executor'] or parent['model'] != task['model']):
+                    self.steering(inbound_id) or parent['executor'] != task['executor'] or parent['model'] != task['model'] or
+                    parent['effort'] != task['effort']):
                 return None
             earlier = self.db.execute("SELECT 1 FROM turn WHERE task_id=? AND inbound_id<? AND id!=? "
                 "AND status IN ('queued','running') AND NOT EXISTS (SELECT 1 FROM steering "
@@ -262,7 +267,8 @@ class Storage:
             input_id = str(uuid.uuid4())
             self.db.execute("INSERT INTO steering(inbound_id,parent_turn_id,input_id,state) VALUES (?,?,?,'sending')",
                             (inbound_id, parent_id, input_id))
-            self.db.execute("UPDATE turn SET executor=?,model=? WHERE id=?", (parent['executor'], parent['model'], child['id']))
+            self.db.execute("UPDATE turn SET executor=?,model=?,effort=? WHERE id=?",
+                            (parent['executor'], parent['model'], parent['effort'], child['id']))
             return input_id
 
     def steer_outcome(self, inbound_id, status, detail=''):
@@ -271,12 +277,12 @@ class Storage:
             changed = self.db.execute("UPDATE steering SET state=?,detail=? WHERE inbound_id=? AND state!='accepted'",
                                      (status, detail, inbound_id)).rowcount
             if changed and status in {'queued', 'unknown'}:
-                self.db.execute("UPDATE turn SET executor=NULL,model=NULL WHERE inbound_id=? AND status='queued'", (inbound_id,))
+                self.db.execute("UPDATE turn SET executor=NULL,model=NULL,effort=NULL WHERE inbound_id=? AND status='queued'", (inbound_id,))
 
     def recover_steering(self):
         with self.db:
             self.db.execute("UPDATE steering SET state='unknown',detail='Service restarted before acknowledgement' WHERE state='sending'")
-            self.db.execute("UPDATE turn SET executor=NULL,model=NULL WHERE status='queued' AND inbound_id IN "
+            self.db.execute("UPDATE turn SET executor=NULL,model=NULL,effort=NULL WHERE status='queued' AND inbound_id IN "
                             "(SELECT inbound_id FROM steering WHERE state='unknown')")
 
     def input_text(self, inbound_id):
@@ -311,11 +317,11 @@ class Storage:
                 self.finish(turn["id"], "failed", "Restart recovery limit reached")
                 return None, True
             # Binding is immutable. NULL executor denotes an unclaimed/legacy turn;
-            # NULL model with a recorded executor means that executor's default.
+            # NULL model/effort with a recorded executor mean executor/model defaults.
             if turn['executor'] is None:
                 task = self.task(turn['conversation_id'], turn['task_id'])
-                self.db.execute("UPDATE turn SET executor=?,model=? WHERE id=?",
-                                (task['executor'], task['model'], turn['id']))
+                self.db.execute("UPDATE turn SET executor=?,model=?,effort=? WHERE id=?",
+                                (task['executor'], task['model'], task['effort'], turn['id']))
             if recovering:
                 self.db.execute("UPDATE turn SET recovery_count=recovery_count+1 WHERE id=?", (turn["id"],))
             self.db.execute("UPDATE turn SET status='running' WHERE id=?", (turn["id"],))
@@ -342,9 +348,9 @@ class Storage:
                         # before a buffered acknowledgement reaches the journal.
                         # Restore the actual accepting run, never current /model.
                         self.db.execute("UPDATE turn SET executor=(SELECT executor FROM turn WHERE id=?),"
-                            "model=(SELECT model FROM turn WHERE id=?) WHERE inbound_id="
+                            "model=(SELECT model FROM turn WHERE id=?),effort=(SELECT effort FROM turn WHERE id=?) WHERE inbound_id="
                             "(SELECT inbound_id FROM steering WHERE input_id=?) AND status IN ('queued','cancelled')",
-                            (turn_id, turn_id, event.data['input_id']))
+                            (turn_id, turn_id, turn_id, event.data['input_id']))
                 if event.session_id:
                     self.db.execute("UPDATE turn SET session_id=? WHERE id=?", (event.session_id, turn_id))
                     self.db.execute("""INSERT INTO task_session(task_id,executor,session_id)
@@ -405,17 +411,21 @@ class Storage:
             self.db.execute("UPDATE inbound SET state=? WHERE id=(SELECT inbound_id FROM turn WHERE id=?) AND state != 'cancelled'",
                             ("cancelled" if status == "cancelled" else "done", turn_id))
 
-    def _create_task(self, conversation_id, executor=None, model=None, title=None):
-        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model,title,last_active,title_source) VALUES (?,?,?,?,?,?)",
+    def _create_task(self, conversation_id, executor=None, model=None, title=None, effort=None):
+        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model,title,last_active,title_source,effort) VALUES (?,?,?,?,?,?,?)",
                                   (conversation_id, executor or self.default_executor, model, title, now(),
-                                   'manual' if title is not None else 'fallback')).lastrowid
+                                   'manual' if title is not None else 'fallback', effort)).lastrowid
         self.db.execute("UPDATE conversation SET active_task_id=? WHERE id=?", (task_id, conversation_id))
         return task_id
 
     def new_task(self, inbound_id, executor=None, title=None):
         with self.db:
             row = self.inbound(inbound_id)
-            task_id = self._create_task(row['conversation_id'], executor, title=title)
+            active = self.active_task(row['conversation_id'])
+            inherit = active is not None and (executor is None or executor == active['executor'])
+            task_id = self._create_task(row['conversation_id'],
+                active['executor'] if inherit else executor, active['model'] if inherit else None,
+                title, active['effort'] if inherit else None)
             self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
         return self.task(row['conversation_id'], task_id)
 
@@ -692,18 +702,32 @@ class Storage:
                                       (title, request['task_id'])).rowcount
             self.title_event(request, 'generated' if changed else 'superseded', title if changed else None)
 
-    def set_model(self, inbound_id, executor, model, task_id=None):
+    def set_model(self, inbound_id, executor, model, task_id=None, *, reset_effort=False, new_task=False):
         with self.db:
             row = self.inbound(inbound_id)
             task = self.task(row['conversation_id'], task_id) if task_id is not None else self.active_task(row['conversation_id'])
+            if new_task:
+                task = None
             switched = task is not None and task['executor'] != executor
             if task is None:
                 task_id = self._create_task(row['conversation_id'], executor, model)
             else:
                 task_id = task['id']
-                self.db.execute("UPDATE task SET executor=?,model=? WHERE id=?", (executor, model, task_id))
+                self.db.execute("UPDATE task SET executor=?,model=?,effort=? WHERE id=?",
+                                (executor, model, None if reset_effort else task['effort'], task_id))
             self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
         return self.task(row['conversation_id'], task_id), switched
+
+    def set_effort(self, inbound_id, effort, task_id=None, *, new_task=False):
+        with self.db:
+            row = self.inbound(inbound_id)
+            task = self.task(row['conversation_id'], task_id) if task_id is not None else self.active_task(row['conversation_id'])
+            if new_task:
+                task = None
+            task_id = task['id'] if task else self._create_task(row['conversation_id'])
+            self.db.execute("UPDATE task SET effort=? WHERE id=?", (effort, task_id))
+            self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+        return self.task(row['conversation_id'], task_id)
 
     def session(self, task_id, executor):
         return self.db.execute("SELECT * FROM task_session WHERE task_id=? AND executor=?", (task_id, executor)).fetchone()
@@ -850,7 +874,7 @@ class Storage:
         return [(t['id'], t['task_id']) for t in turns if t['status'] == 'running'], sum(t['status'] == 'queued' for t in turns)
 
 
-COMMANDS = frozenset({'/new', '/tasks', '/task', '/model', '/stop', '/close', '/title', '/q'})
+COMMANDS = frozenset({'/new', '/tasks', '/task', '/model', '/effort', '/stop', '/close', '/title', '/q'})
 
 
 def now():

@@ -718,7 +718,7 @@ async def test_exception_parent_wakes_delayed_fallback_without_new_message(tmp_p
     class Executor:
         supports_steer = True
         prompts = []
-        async def start(self, run_id, prompt, model=None):
+        async def start(self, run_id, prompt, model=None, effort=None):
             self.prompts.append(prompt)
             yield Record(None, {}, (Event('session_started', {}, {}, 'session'),))
             if run_id == 1:
@@ -726,8 +726,8 @@ async def test_exception_parent_wakes_delayed_fallback_without_new_message(tmp_p
                 await fail.wait()
                 raise RuntimeError('synthetic stream failure')
             yield Record(None, {}, (Event('turn_completed', {'status': 'completed', 'text': 'fallback complete'}, {}),))
-        def resume(self, run_id, session_id, prompt, model=None):
-            return self.start(run_id, prompt, model)
+        def resume(self, run_id, session_id, prompt, model=None, effort=None):
+            return self.start(run_id, prompt, model, effort=effort)
         async def steer(self, run_id, input_id, text):
             injected.set()
             await asyncio.sleep(.15)

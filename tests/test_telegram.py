@@ -225,7 +225,7 @@ async def test_commands_registered_once_and_failure_does_not_stop_poll(registrat
     with pytest.raises(asyncio.CancelledError):
         await channel.poll(AsyncMock())
     bot.set_my_commands.assert_awaited_once()
-    assert [name for name, _ in bot.set_my_commands.call_args.args[0]] == ['new', 'tasks', 'model', 'stop', 'q', 'close', 'title']
+    assert [name for name, _ in bot.set_my_commands.call_args.args[0]] == ['new', 'tasks', 'model', 'effort', 'stop', 'q', 'close', 'title']
     assert bot.get_updates.await_count == 2
     if registration_error:
         assert 'command registration failed' in caplog.text
@@ -259,7 +259,7 @@ async def test_poll_callbacks_authorization_ack_and_stable_id():
                                effective_chat=SimpleNamespace(id=10, type=kind),
                                effective_message=SimpleNamespace(message_id=20, text='Task list'),
                                callback_query=callback)
-    updates = [update(1, owner=2), update(2, kind='group'), update(3), update(4, failure=True), update(5, data='bad payload')]
+    updates = [update(1, owner=2), update(2, kind='group'), update(3), update(4, failure=True), update(5, data='bad payload'), update(6, data='м' * 33), update(7, data='')]
     updates.append(updates[2])  # Same callback id remains deduplicable on redelivery.
     bot.get_updates = AsyncMock(side_effect=[updates, asyncio.CancelledError()])
     async def receive(message):
