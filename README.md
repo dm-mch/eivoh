@@ -260,7 +260,7 @@ Three automatic recovery attempts are allowed
 per turn before visible failure. Errors/results emitted after shutdown begins
 remain in the raw journal but cannot finalize the interrupted turn on replay.
 External tool effects are not exactly-once: an action may precede its persisted
-result. The first ID of an answer or task-specific notice is durable for reply routing;
+result. The IDs of every part of an answer or task-specific notice are durable for reply routing;
 split-message edit state and delivery acknowledgments remain ephemeral, so recovery
 can still post a new answer. A crash between sending and storing an outbound ID
 can leave that message without a reply mapping.
