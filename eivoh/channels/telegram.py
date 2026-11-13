@@ -10,16 +10,21 @@ import logging
 from telegram import Bot
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 
+from ..speech import TranscriptionError
 from .base import Inbound
 from .formatting import plain_text, render_chunks
 
 log = logging.getLogger(__name__)
 
 
+VOICE_PREFIX = "[Voice message, speech-to-text]\n"
+
+
 class TelegramChannel:
-    def __init__(self, token: str, owner_id: int, bot=None):
+    def __init__(self, token: str, owner_id: int, bot=None, transcriber=None):
         self.bot = bot if bot is not None else Bot(token)
         self.owner_id = owner_id
+        self.transcriber = transcriber
         self.locks = {}
         self.blocked_until = {}
         self.messages = {}  # logical first id -> chunk ids; V1 delivery state is ephemeral
@@ -50,7 +55,36 @@ class TelegramChannel:
                     # the gateway has committed each accepted inbound to SQLite.
                     await receive(Inbound("telegram", str(chat.id), str(user.id),
                                           str(message.message_id), message.text))
+                elif message and (message.voice or message.audio):
+                    # Transcribed before journaling: a crash here leaves the update
+                    # unacknowledged, so it is fetched and transcribed again.
+                    text = await self._transcribe(str(chat.id), message.voice or message.audio)
+                    if text:
+                        await receive(Inbound("telegram", str(chat.id), str(user.id),
+                                              str(message.message_id), VOICE_PREFIX + text))
                 offset = update.update_id + 1
+
+    async def _transcribe(self, chat, media):
+        if self.transcriber is None:
+            await self._request(chat, self.bot.send_message, text="Voice messages are not configured (no SONIOX_API_KEY).")
+            return None
+        await self.typing(chat)
+        try:
+            file = await self.bot.get_file(media.file_id)
+            audio = bytes(await file.download_as_bytearray())
+            text = await self.transcriber.transcribe(audio, getattr(media, "file_name", None) or "voice.ogg")
+        except Exception as exc:
+            log.warning("Voice transcription failed: %s", type(exc).__name__)
+            # Only our own messages are shown; others may carry request details.
+            reason = str(exc) if isinstance(exc, TranscriptionError) else type(exc).__name__
+            await self._request(chat, self.bot.send_message, text=f"Could not transcribe the voice message: {reason}")
+            return None
+        if not text:
+            await self._request(chat, self.bot.send_message, text="The voice message transcript is empty.")
+            return None
+        # Plain text echo so recognition errors are visible before the answer.
+        await self._request(chat, self.bot.send_message, text="🎤 " + (text if len(text) < 4000 else text[:4000] + "…"))
+        return text
 
     async def _request(self, chat, method, **kwargs):
         # One lock covers sends, edits, deletes and typing, including RetryAfter.

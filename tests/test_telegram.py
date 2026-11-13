@@ -95,3 +95,45 @@ async def test_poll_owner_private_and_ack_after_journal(rig):
     with pytest.raises(asyncio.CancelledError):
         await channel.poll(receive)
     assert len(storage.pending()) == 1
+
+
+async def test_voice_is_transcribed_echoed_and_journaled(rig):
+    from eivoh.channels.telegram import VOICE_PREFIX
+    from eivoh.speech import TranscriptionError
+    _, storage, _, _, _ = rig
+    bot = make_bot()
+    bot.get_file = AsyncMock(return_value=SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b'ogg'))))
+    transcriber = SimpleNamespace(transcribe=AsyncMock(side_effect=['привет', TranscriptionError('Soniox down'), '']))
+    channel = TelegramChannel('unused', 1, bot, transcriber=transcriber)
+    def voice(uid, mid):
+        return SimpleNamespace(update_id=uid, effective_user=SimpleNamespace(id=1),
+                               effective_chat=SimpleNamespace(id=10, type='private'),
+                               effective_message=SimpleNamespace(message_id=mid, text=None, audio=None,
+                                                                 voice=SimpleNamespace(file_id=f'f{mid}')))
+    calls = []
+    async def updates(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return [voice(1, 1), voice(2, 2), voice(3, 3)]
+        assert kwargs['offset'] == 4
+        raise asyncio.CancelledError
+    bot.get_updates = updates
+    async def receive(message):
+        storage.journal(message)
+    with pytest.raises(asyncio.CancelledError):
+        await channel.poll(receive)
+    assert transcriber.transcribe.await_args_list[0].args[0] == b'ogg'
+    assert [r['text'] for r in storage.pending()] == [VOICE_PREFIX + 'привет']
+    sent = [c.kwargs['text'] for c in bot.send_message.call_args_list]
+    assert sent == ['🎤 привет', 'Could not transcribe the voice message: Soniox down',
+                    'The voice message transcript is empty.']
+    assert all('parse_mode' not in c.kwargs for c in bot.send_message.call_args_list)
+
+
+async def test_voice_without_transcriber_is_refused(rig):
+    _, storage, _, _, _ = rig
+    bot = make_bot()
+    channel = TelegramChannel('unused', 1, bot)
+    msg = SimpleNamespace(message_id=1, text=None, audio=None, voice=SimpleNamespace(file_id='f'))
+    assert await channel._transcribe('10', msg.voice) is None
+    assert 'not configured' in bot.send_message.call_args.kwargs['text']

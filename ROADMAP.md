@@ -59,7 +59,7 @@ Build:
 
 * Codex CLI adapter through `codex exec --json` and `codex exec resume`, one process per turn, cancel by terminating the process tree.
 * Choice of executor per task from the chat; several tasks in one chat with a list and switching. No studied project has a model for several tasks in one chat, so this is our own design.
-* Voice messages in, files and images in and out.
+* Voice messages in, files and images in and out. Voice in is built early: Telegram voice and audio go through the Soniox async API (`stt-async-v6`) before journaling, and the transcript is echoed to the chat. On 15–93 s notes it took 3–6 s; the Soniox real-time WebSocket took about as long as the audio, so it is not used for recorded files.
 * Reliability: one consumer per bot token with a local lock and recovery from a polling conflict, removal of duplicate updates after a restart, sending rules that do not post duplicates.
 
 Reuse:

@@ -14,6 +14,7 @@ class Config:
     permission_mode: str = "bypassPermissions"
     claude_bin: str = "claude"
     claude_args: tuple[str, ...] = ()
+    soniox_api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -40,4 +41,5 @@ class Config:
         return cls(token, int(owner),
                    Path(os.environ.get("EIVOH_STATE_DIR", "~/.local/state/eivoh")).expanduser().resolve(),
                    workdir, os.environ.get("EIVOH_CLAUDE_MODEL") or None,
-                   mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"), claude_args)
+                   mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"), claude_args,
+                   os.environ.get("SONIOX_API_KEY", "").strip() or None)
