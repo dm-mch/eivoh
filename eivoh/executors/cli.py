@@ -92,7 +92,7 @@ class CliExecutor:
         self.running: dict[int, ProcessTree] = {}
         self.starting: dict[int, asyncio.Task] = {}
 
-    def command(self, session_id: str | None) -> list[str]:
+    def command(self, session_id: str | None, model=None) -> list[str]:
         raise NotImplementedError
 
     def environment(self) -> dict[str, str]:
@@ -102,22 +102,22 @@ class CliExecutor:
         """Return a callable str -> Record; a new one for each turn."""
         raise NotImplementedError
 
-    def effective_model(self) -> str | None:
+    def effective_model(self, model=None) -> str | None:
         """The model this turn runs on, as far as Eivoh can tell."""
-        return self.model
+        return model or self.model
 
-    def start(self, run_id, prompt):
-        return self._turn(run_id, prompt)
+    def start(self, run_id, prompt, model=None):
+        return self._turn(run_id, prompt, model=model)
 
-    def resume(self, run_id, session_id, prompt):
+    def resume(self, run_id, session_id, prompt, model=None):
         if not SESSION_ID.fullmatch(session_id):
             raise ValueError("Invalid executor session id")
-        return self._turn(run_id, prompt, session_id)
+        return self._turn(run_id, prompt, session_id, model)
 
-    async def _turn(self, run_id, prompt, session_id=None):
+    async def _turn(self, run_id, prompt, session_id=None, model=None):
         if run_id in self.running or run_id in self.starting:
             raise RuntimeError("Run already running")
-        args = self.command(session_id)
+        args = self.command(session_id, model)
         env = self.environment()
         parse_line = self.parser()
         async def spawn():
@@ -148,7 +148,7 @@ class CliExecutor:
         queue = asyncio.Queue()
         # Journal what ran: later calibration by executor and model needs it.
         # The prompt goes to stdin, so argv holds no message content.
-        await queue.put(Record(None, {"executor": type(self).__name__, "model": self.effective_model(),
+        await queue.put(Record(None, {"executor": type(self).__name__, "model": self.effective_model(model),
                                       "argv": args, "cwd": str(self.workdir)}, stream="meta"))
 
         async def read(pipe, stream):

@@ -43,6 +43,7 @@ MIGRATIONS = (
         """CREATE TRIGGER raw_event_no_delete BEFORE DELETE ON raw_event
                 BEGIN SELECT RAISE(ABORT, 'raw events are append-only'); END;""",
     ),
+    ("ALTER TABLE task ADD COLUMN model TEXT",),
 )
 
 
@@ -84,7 +85,7 @@ class Storage:
             if not cur.rowcount:
                 return None
             inbound_id = cur.lastrowid
-            if command(message.text) not in {"/stop", "/new"}:
+            if command(message.text) not in {"/stop", "/new", "/model"}:
                 active = self.db.execute("SELECT active_task_id FROM conversation WHERE id=?", (conv,)).fetchone()[0]
                 if active is None:
                     active = self._create_task(conv)
@@ -120,11 +121,12 @@ class Storage:
             self.db.execute("UPDATE turn SET status='running' WHERE id=?", (turn["id"],))
             self.db.execute("UPDATE inbound SET state='running' WHERE id=?", (inbound_id,))
         claimed = dict(self.turn_for(inbound_id))
-        # Retain the ID observed for this turn as evidence; otherwise resume
-        # the task's current session. Recovery always includes the request.
-        task = self.db.execute("SELECT session_id, executor FROM task WHERE id=?", (claimed["task_id"],)).fetchone()
-        claimed["resume_id"] = claimed["session_id"] or task["session_id"]
+        # The turn's observed ID remains evidence; routing, including recovery,
+        # uses the task's current session, executor and model.
+        task = self.db.execute("SELECT session_id, executor, model FROM task WHERE id=?", (claimed["task_id"],)).fetchone()
+        claimed["resume_id"] = task["session_id"]
         claimed["executor"] = task["executor"]
+        claimed["model"] = task["model"]
         return claimed, recovering
 
     def append(self, turn_id: int, record: Record, *, allow_result=True):
@@ -146,9 +148,9 @@ class Storage:
             self.db.execute("UPDATE inbound SET state=? WHERE id=(SELECT inbound_id FROM turn WHERE id=?) AND state != 'cancelled'",
                             ("cancelled" if status == "cancelled" else "done", turn_id))
 
-    def _create_task(self, conversation_id, executor=None):
-        task_id = self.db.execute("INSERT INTO task(conversation_id,executor) VALUES (?,?)",
-                                  (conversation_id, executor or self.default_executor)).lastrowid
+    def _create_task(self, conversation_id, executor=None, model=None):
+        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model) VALUES (?,?,?)",
+                                  (conversation_id, executor or self.default_executor, model)).lastrowid
         self.db.execute("UPDATE conversation SET active_task_id=? WHERE id=?", (task_id, conversation_id))
         return task_id
 
@@ -162,6 +164,49 @@ class Storage:
     def finish_command(self, inbound_id):
         with self.db:
             self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+
+    def active_task(self, conversation_id):
+        return self.db.execute("SELECT task.* FROM task JOIN conversation ON task.id=conversation.active_task_id WHERE conversation.id=?",
+                               (conversation_id,)).fetchone()
+
+    def set_model(self, inbound_id, executor, model):
+        """Change routing and consume the FIFO command in the same transaction."""
+        with self.db:
+            row = self.inbound(inbound_id)
+            task = self.active_task(row["conversation_id"])
+            switched = task is not None and task["executor"] != executor
+            if task is None:
+                self._create_task(row["conversation_id"], executor, model)
+            else:
+                self.db.execute("UPDATE task SET executor=?,model=?,session_id=? WHERE id=?",
+                                (executor, model, None if switched else task["session_id"], task["id"]))
+            self.db.execute("UPDATE inbound SET state='done' WHERE id=?", (inbound_id,))
+        return self.active_task(row["conversation_id"]), switched
+
+    def transcript(self, task_id, before_inbound_id, limit=30000):
+        """A bounded suffix of whole earlier turns, rendered oldest first."""
+        blocks, size, truncated = [], 0, False
+        rows = self.db.execute("SELECT turn.id,inbound.text FROM turn JOIN inbound ON inbound.id=turn.inbound_id "
+                               "WHERE turn.task_id=? AND turn.inbound_id<? AND (turn.status IN ('completed','failed') "
+                               "OR (turn.status='cancelled' AND EXISTS (SELECT 1 FROM raw_event WHERE turn_id=turn.id))) "
+                               "ORDER BY turn.inbound_id DESC",
+                               (task_id, before_inbound_id))
+        for row in rows:
+            result = self.stored_result(row["id"])
+            answer = result[0] if result is not None else "[No stored final answer.]"
+            block = f"User:\n{row['text']}\n\nAssistant:\n{answer}\n\n"
+            if size + len(block) > limit:
+                truncated = True
+                break
+            blocks.append(block)
+            size += len(block)
+        notice = ""
+        if truncated:
+            notice = "[Transcript truncated: oldest turns omitted.]\n\n"[:limit]
+            while blocks and size + len(notice) > limit:
+                size -= len(blocks.pop())
+        text = notice + "".join(reversed(blocks))
+        return text, len(blocks), truncated
 
     def stored_result(self, turn_id):
         """Replay normalized events after a crash, without invoking the executor."""

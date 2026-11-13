@@ -5,6 +5,7 @@ import logging
 
 from .channels.base import Channel, Inbound
 from .executors.base import Executor
+from .models import catalog, resolve
 from .storage import Storage, command
 
 log = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class Gateway:
         self.max_recoveries = max_recoveries
         self.workers = {}
         self.locks = {}
+        self.model_catalogs = {}  # Numbers refer to the last list shown in this process.
         self.closing = False
 
     async def start(self):
@@ -152,6 +154,9 @@ class Gateway:
                 self.storage.new_task(row["id"], name)
                 await safe_call(channel.send, row["chat_id"], f"New task on {name}. Your next message starts its executor session.")
                 continue
+            if command(row["text"]) == "/model":
+                await self._model(row, channel)
+                continue
             pending_turn = self.storage.turn_for(row["id"])
             result = self.storage.stored_result(pending_turn["id"])
             if result is not None:
@@ -170,6 +175,54 @@ class Gateway:
                 continue
             await self._run(row, turn, recovering)
 
+    async def _model(self, row, channel):
+        parts = row["text"].split(maxsplit=1)
+        conv = row["conversation_id"]
+        if len(parts) == 1:
+            task = self.storage.active_task(conv)
+            name = task["executor"] if task else self.default_executor
+            model = task["model"] if task else None
+            choices = catalog()
+            self.model_catalogs[conv] = choices
+            lines = [f"Model: {name} / {model or 'default'}."]
+            number = 0
+            for executor, models in choices.items():
+                lines.append(f"\n{executor}:")
+                for model_id, description in models:
+                    number += 1
+                    lines.append(f"{number}. {model_id}" + (f" — {description}" if description else ""))
+                if not models:
+                    lines.append("No models available.")
+            lines.append("\nChoose with /model <name or number>.")
+            reply = "\n".join(lines)
+            self.storage.finish_command(row["id"])
+        else:
+            try:
+                choice = parts[1].strip()
+                choices = None
+                if choice.isdecimal():
+                    choices = self.model_catalogs.get(conv)
+                    if choices is None:
+                        raise ValueError("Use /model to list numbered choices first (also after a restart).")
+                name, model = resolve(choice, choices)
+                if name not in self.executors:
+                    raise ValueError(f"Executor {name} is not configured.")
+            except ValueError as exc:
+                self.storage.finish_command(row["id"])
+                reply = str(exc)
+            else:
+                task, switched = self.storage.set_model(row["id"], name, model)
+                if switched:
+                    _, count, truncated = self.storage.transcript(task["id"], row["id"])
+                    reply = f"Switched to {name} / {model}; context will be passed as a transcript of {count} earlier turns."
+                    if truncated:
+                        reply += " Transcript truncated: oldest turns omitted."
+                elif task["session_id"]:
+                    reply = f"Model: {name} / {model}. Context kept (same session)."
+                else:
+                    reply = f"Model: {name} / {model}. Your next message starts its executor session."
+        await safe_call(channel.send, row["chat_id"], reply)
+
     async def _typing(self, channel, chat):
         # Studied reference: nanobot (MIT), nanobot/channels/telegram/runtime.py.
         # Own generic implementation; no copied source.
@@ -185,14 +238,18 @@ class Gateway:
         completed = False
         current_deltas = False
         prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{row['text']}" if recovering and turn["resume_id"] else row["text"]
+        if not turn["resume_id"]:
+            transcript, _, _ = self.storage.transcript(turn["task_id"], row["id"])
+            if transcript:
+                prompt = f"Earlier conversation in this task (transcript from Eivoh):\n\n{transcript}End of transcript.\n\nCurrent request:\n{prompt}"
         try:
             if recovering:
                 await safe_call(channel.send, chat, f"Service restarted; recovering task {turn['task_id']} (attempt {turn['recovery_count']}/{self.max_recoveries}).")
             executor = self.executors.get(turn["executor"])
             if executor is None:
                 raise RuntimeError(f"Executor {turn['executor']} is not configured")
-            stream = (executor.resume(turn["id"], turn["resume_id"], prompt)
-                      if turn["resume_id"] else executor.start(turn["id"], prompt))
+            stream = (executor.resume(turn["id"], turn["resume_id"], prompt, model=turn["model"])
+                      if turn["resume_id"] else executor.start(turn["id"], prompt, model=turn["model"]))
             async def consume():
                 nonlocal text, tool, error, completed, current_deltas
                 async with aclosing(stream):

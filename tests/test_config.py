@@ -35,8 +35,8 @@ def test_config(monkeypatch, tmp_path):
 @pytest.mark.parametrize(('value', 'expected'), [
     ('', ()),
     ('   ', ()),
-    ('''--settings '{"enabledPlugins":{"example-plugin@example-marketplace":false}}' --model "a model"''',
-     ('--settings', '{"enabledPlugins":{"example-plugin@example-marketplace":false}}', '--model', 'a model')),
+    ('''--settings '{"enabledPlugins":{"example-plugin@example-marketplace":false}}' ''',
+     ('--settings', '{"enabledPlugins":{"example-plugin@example-marketplace":false}}')),
 ])
 def test_claude_args_parsing(monkeypatch, tmp_path, value, expected):
     monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
@@ -51,6 +51,7 @@ def test_claude_args_parsing(monkeypatch, tmp_path, value, expected):
     '--print', '--print=prompt', '--output-format json', '--output-format=json',
     '--input-format json', '--input-format=json',
     '--permission-mode plan', '--permission-mode=plan',
+    '--model opus', '--model=opus',
 ])
 def test_claude_args_reject_owned_flags(monkeypatch, tmp_path, value):
     monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
@@ -95,7 +96,7 @@ def test_codex_config(monkeypatch, tmp_path):
     monkeypatch.setenv('EIVOH_CODEX_ARGS', '-c model_reasoning_effort="high"')
     config = Config.from_env()
     assert config.default_executor == 'codex' and config.codex_args == ('-c', 'model_reasoning_effort=high')
-    for bad in ('-C /tmp', 'resume', '--cd=/tmp'):
+    for bad in ('-C /tmp', 'resume', '--cd=/tmp', '--model model', '--model=model', '-m model', '-mmodel'):
         monkeypatch.setenv('EIVOH_CODEX_ARGS', bad)
         with pytest.raises(ValueError, match='adapter-owned'):
             Config.from_env()

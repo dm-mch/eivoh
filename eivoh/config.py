@@ -40,7 +40,7 @@ class Config:
             claude_args = tuple(shlex.split(os.environ.get("EIVOH_CLAUDE_ARGS", "")))
         except ValueError as exc:
             raise ValueError("Invalid quoting in EIVOH_CLAUDE_ARGS") from exc
-        owned = {"--resume", "-p", "--print", "--output-format", "--input-format", "--permission-mode"}
+        owned = {"--resume", "-p", "--print", "--output-format", "--input-format", "--permission-mode", "--model"}
         for arg in claude_args:
             if arg.split("=", 1)[0] in owned or arg.startswith("-p"):
                 raise ValueError("EIVOH_CLAUDE_ARGS contains an adapter-owned flag")
@@ -49,7 +49,7 @@ class Config:
         except ValueError as exc:
             raise ValueError("Invalid quoting in EIVOH_CODEX_ARGS") from exc
         for arg in codex_args:
-            if arg in {"exec", "resume", "--json", "-C", "--cd"} or arg.startswith("--cd="):
+            if arg.split("=", 1)[0] in {"exec", "resume", "--json", "-C", "--cd", "--model", "-m"} or arg.startswith("-m"):
                 raise ValueError("EIVOH_CODEX_ARGS contains an adapter-owned argument")
         default_executor = os.environ.get("EIVOH_DEFAULT_EXECUTOR", "claude").strip().lower()
         if default_executor not in {"claude", "codex"}:

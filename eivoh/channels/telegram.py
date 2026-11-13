@@ -30,6 +30,14 @@ class TelegramChannel:
         self.messages = {}  # logical first id -> chunk ids; V1 delivery state is ephemeral
 
     async def poll(self, receive):
+        try:
+            await self.bot.set_my_commands([
+                ("new", "Start a new task"),
+                ("model", "Show or change the task model"),
+                ("stop", "Stop running and queued work"),
+            ])
+        except Exception as exc:
+            log.warning("Telegram command registration failed: %s", type(exc).__name__)
         offset = None
         while True:
             try:

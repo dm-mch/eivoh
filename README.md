@@ -57,6 +57,7 @@ EIVOH_WORKDIR=/home/your-user/src/eivoh
 # Optional overrides:
 # EIVOH_STATE_DIR=/home/your-user/.local/state/eivoh
 # EIVOH_CLAUDE_MODEL=haiku
+# EIVOH_CLAUDE_MODELS=fable,opus,sonnet,haiku,claude-fable-5-2,claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5
 # EIVOH_CLAUDE_PERMISSION_MODE=bypassPermissions
 # EIVOH_CLAUDE_BIN=claude
 # EIVOH_CLAUDE_ARGS=
@@ -77,7 +78,7 @@ modes' headless behavior is unverified. Eivoh removes inherited `CLAUDE*` and
 `EIVOH_CLAUDE_ARGS` is empty by default. It is split with Python's `shlex.split`
 (shell-style quoting, without shell expansion) and appended after all built-in
 Claude arguments on both start and resume. The adapter owns `--resume`,
-`-p`/`--print`, `--output-format`, `--input-format` and `--permission-mode`;
+`-p`/`--print`, `--output-format`, `--input-format`, `--permission-mode` and `--model`;
 these flags are rejected here, including `--flag=value` forms.
 Claude Code plugins enabled globally also load in the executor. To disable a
 plugin, pass a settings override, for example with this shell command:
@@ -89,7 +90,7 @@ export EIVOH_CLAUDE_ARGS="--settings '{\"enabledPlugins\":{\"example-plugin@exam
 For the systemd environment file, use the same quoted value without `export`.
 
 Codex is the second executor (installed `codex` CLI with ChatGPT login). A task
-uses the executor chosen when it was created: `/new codex` or `/new claude`; plain
+initially uses the executor chosen by `/new codex` or `/new claude`; plain
 `/new` and the first task use `EIVOH_DEFAULT_EXECUTOR` (default `claude`). Each
 turn runs `codex exec --json --dangerously-bypass-approvals-and-sandbox ... -` (or
 `codex exec ... resume <thread_id> -`; all options precede `resume`) in `EIVOH_WORKDIR`, with the prompt on
@@ -98,9 +99,35 @@ hosts that forbid unprivileged user namespaces its bubblewrap sandbox cannot
 start anyway. Inherited `OPENAI_*` and `CODEX_API_KEY` variables are removed so
 the subscription login is used. `EIVOH_CODEX_ARGS` (shlex-split, for example
 `-c model_reasoning_effort="high"`) is appended on start and resume; `exec`,
-`resume`, `--json` and `-C`/`--cd` are rejected. Codex sends whole messages, not
+`resume`, `--json`, `-C`/`--cd` and `-m`/`--model` are rejected. Set model defaults
+with `EIVOH_CLAUDE_MODEL` or `EIVOH_CODEX_MODEL`, so extra arguments cannot override
+the task's model selection. Codex sends whole messages, not
 text deltas, so its answer grows message by message; the final answer is its
 last message.
+
+`/model` shows the active task's executor and selected model (`default` means
+the executor's configured default), followed by a numbered catalog grouped by
+executor. Use `/model <name or number>`, for example `/model claude-opus-5-5`
+or `/model astra`. Names match case-insensitively: an exact ID or alias takes
+priority over a unique substring; ambiguous and unknown names list candidates.
+Numbers refer to the last catalog shown in that chat; list again after a restart.
+Claude's built-in catalog contains Fable, Opus, Sonnet and Haiku aliases and the
+versioned IDs above. `EIVOH_CLAUDE_MODELS` replaces that list with comma-separated
+IDs or aliases. Codex's catalog is read on demand from
+`$CODEX_HOME/models_cache.json` (default `~/.codex/models_cache.json`), using only
+entries with `visibility: "list"`; an unreadable cache gives an empty list.
+
+Model selection is stored per task. Within the same executor it keeps the native
+session; switching between Claude and Codex clears the session and starts a new
+one on the next message. Eivoh passes earlier user texts and stored final answers
+as a transcript, oldest first, capped at 30,000 characters by omitting oldest
+whole turns and marking truncation. This transfers conversation text, not native
+tool/session state; turns without a stored final answer are marked as such.
+The switch reply reports the number of included turns. With no active task,
+selection creates one. Telegram's `/new`, `/model` and `/stop` menu is registered
+once at polling startup, best-effort. Migration, model selection, CLI arguments,
+session reuse, transcript handoff, recovery and menu registration are tested
+offline with fakes; live use of `/model` remains unverified.
 
 Only the numeric owner in a private chat is admitted. Use one instance and a
 dedicated token; multi-instance locking belongs to V2.
@@ -138,17 +165,19 @@ command stubs; actual worktree creation, uv installation and systemd operation
 have not been exercised by this review-fix task.
 
 Messages are turns within the active task and continue its executor session in
-FIFO order. `/new` takes its place in that queue, closes the previous task and
+FIFO order. `/model` takes its place in that queue without creating a turn and
+applies to subsequent messages. `/new` closes the previous task in FIFO order and
 creates a new active task with no session. Queued turns bind to the active task
 at dispatch. `/stop` bypasses the queue, cancels the running turn and all earlier
-queued messages (including `/new`), and
+queued messages (including `/new` and `/model`), and
 reports the task IDs and queued count. Cancelled messages remain in the journal.
 
 SQLite (`eivoh.sqlite3` in the state directory) uses WAL and synchronous FULL for
 durable inbound commits before processing and polling acknowledgment. Schema
 changes use ordered transactional migrations and `PRAGMA user_version`; migration
 1 assumes a new database, with no upgrade from the unreleased prototype layout.
-Conversations point to active tasks; tasks own executor choice and session ID;
+Migration 2 upgrades version 1 in place, adding a nullable task model.
+Conversations point to active tasks; tasks own executor/model choice and session ID;
 turns retain their observed session ID and raw events. Raw stdout
 and stderr lines are append-only; invalid UTF-8 uses replacement characters.
 SIGTERM marks shutdown before polling cleanup. `KillMode=mixed` lets the gateway

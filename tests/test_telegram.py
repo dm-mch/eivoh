@@ -10,6 +10,7 @@ from eivoh.channels.telegram import TelegramChannel
 
 def make_bot():
     return SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=5)),
+                           set_my_commands=AsyncMock(return_value=True),
                            edit_message_text=AsyncMock(return_value=True),
                            delete_message=AsyncMock(return_value=True),
                            send_chat_action=AsyncMock(return_value=True))
@@ -137,3 +138,18 @@ async def test_voice_without_transcriber_is_refused(rig):
     msg = SimpleNamespace(message_id=1, text=None, audio=None, voice=SimpleNamespace(file_id='f'))
     assert await channel._transcribe('10', msg.voice) is None
     assert 'not configured' in bot.send_message.call_args.kwargs['text']
+
+
+@pytest.mark.parametrize('registration_error', [None, NetworkError('offline')])
+async def test_commands_registered_once_and_failure_does_not_stop_poll(registration_error, caplog):
+    bot = make_bot()
+    bot.set_my_commands.side_effect = registration_error
+    bot.get_updates = AsyncMock(side_effect=[[], asyncio.CancelledError()])
+    channel = TelegramChannel('unused', 1, bot)
+    with pytest.raises(asyncio.CancelledError):
+        await channel.poll(AsyncMock())
+    bot.set_my_commands.assert_awaited_once()
+    assert [name for name, _ in bot.set_my_commands.call_args.args[0]] == ['new', 'model', 'stop']
+    assert bot.get_updates.await_count == 2
+    if registration_error:
+        assert 'command registration failed' in caplog.text

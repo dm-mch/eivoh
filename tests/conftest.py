@@ -37,6 +37,15 @@ async def until(predicate, timeout=5):
             await asyncio.sleep(0.01)
 
 
+@pytest.fixture(autouse=True)
+def isolated_model_catalog(tmp_path, monkeypatch, request):
+    # Offline tests must not depend on the owner's model cache or CLI config.
+    if request.node.get_closest_marker('live'):
+        return
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path))
+    monkeypatch.delenv('EIVOH_CLAUDE_MODELS', raising=False)
+
+
 @pytest.fixture
 async def rig(tmp_path):
     source = Path(__file__).parent / "fixtures" / "fake_claude.py"

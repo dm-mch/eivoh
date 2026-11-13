@@ -80,7 +80,7 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
 def test_schema_version_reopen_and_future_rejected(tmp_path):
     path = tmp_path / 'version.db'
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 1
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 2
     store.journal(inbound(1, 'retained'))
     store.close()
     store = Storage(path)
@@ -105,7 +105,7 @@ def test_ordered_migrations_rollback_together(tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'MIGRATIONS', original + ((
         'CREATE TABLE later (id INTEGER)',), ('INSERT INTO later VALUES (7)',)))
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 3
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == len(original) + 2
     assert store.db.execute('SELECT id FROM later').fetchone()[0] == 7
     store.close()
 
@@ -120,5 +120,73 @@ def test_stored_result_uses_latest_attempt(tmp_path):
         store.append(turn['id'], parse_line('{"type":"system","subtype":"init","session_id":"session-1"}'))
         store.append(turn['id'], parse_line('{"type":"result","is_error":false,"result":"recovered"}'))
         assert store.stored_result(turn['id']) == ('recovered', None)
+    finally:
+        store.close()
+
+
+def test_v1_upgrades_in_place(tmp_path):
+    from eivoh.storage import MIGRATIONS
+    path = tmp_path / 'v1.db'
+    with sqlite3.connect(path) as db:
+        for statement in MIGRATIONS[0]:
+            db.execute(statement)
+        db.execute('PRAGMA user_version=1')
+        db.execute("INSERT INTO conversation(id,channel,chat_id) VALUES (1,'fake','10')")
+        db.execute("INSERT INTO task(id,conversation_id,executor,session_id) VALUES (1,1,'claude','old-session')")
+        db.execute('UPDATE conversation SET active_task_id=1')
+        db.execute("INSERT INTO inbound(id,conversation_id,channel,chat_id,user_id,message_id,text,state) "
+                   "VALUES (1,1,'fake','10','1','1','original','running')")
+        db.execute("INSERT INTO turn(id,inbound_id,conversation_id,task_id,status,session_id) "
+                   "VALUES (1,1,1,1,'running','old-session')")
+    store = Storage(path)
+    try:
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 2
+        task = store.active_task(1)
+        assert task['model'] is None and task['session_id'] == 'old-session'
+        turn, recovering = store.claim(1, 3)
+        assert recovering and turn['model'] is None and turn['resume_id'] == 'old-session'
+        assert store.inbound(1)['text'] == 'original'
+        assert not store.db.execute('PRAGMA foreign_key_check').fetchall()
+    finally:
+        store.close()
+
+
+def test_transcript_keeps_newest_whole_turns_and_final_answers(tmp_path):
+    import json
+    store = Storage(tmp_path / 'transcript.db')
+    try:
+        for mid, text in enumerate(['old', 'middle', 'latest'], 1):
+            row = store.journal(inbound(mid, text))
+            turn, _ = store.claim(row['id'], 3)
+            store.append(turn['id'], parse_line(json.dumps({
+                'type': 'result', 'result': 'answer ' + text, 'is_error': False})))
+            store.finish(turn['id'], 'completed')
+        full, count, truncated = store.transcript(turn['task_id'], 4)
+        assert count == 3 and not truncated
+        assert full.index('User:\nold') < full.index('User:\nmiddle') < full.index('User:\nlatest')
+        assert 'Assistant:\nanswer latest' in full
+        text, count, truncated = store.transcript(turn['task_id'], 4, limit=100)
+        assert count == 1 and truncated and 'Transcript truncated' in text
+        assert len(text) <= 100
+        assert 'User:\nlatest' in text and 'User:\nold' not in text and 'User:\nmiddle' not in text
+        assert store.transcript(turn['task_id'], 4, limit=1)[1:] == (0, True)
+        assert store.transcript(turn['task_id'] + 1, 4) == ('', 0, False)
+    finally:
+        store.close()
+
+
+def test_recovery_routes_to_current_task_model_and_executor(tmp_path):
+    store = Storage(tmp_path / 'routing.db')
+    try:
+        row = store.journal(inbound(1, 'interrupted'))
+        turn, _ = store.claim(row['id'], 3)
+        store.append(turn['id'], parse_line('{"type":"system","subtype":"init","session_id":"old-session"}'))
+        command_row = store.journal(inbound(2, '/model astra'))
+        store.set_model(command_row['id'], 'codex', 'gpt-6-astra')
+        recovered, recovering = store.claim(row['id'], 3)
+        assert recovering
+        assert recovered['session_id'] == 'old-session'  # Historical evidence only.
+        assert recovered['resume_id'] is None
+        assert (recovered['executor'], recovered['model']) == ('codex', 'gpt-6-astra')
     finally:
         store.close()

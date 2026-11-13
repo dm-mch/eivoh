@@ -83,12 +83,13 @@ class CodexExecutor(CliExecutor):
     def __init__(self, workdir: Path, binary="codex", model=None, grace=0.5, extra_args=()):
         super().__init__(workdir, binary, model, grace, extra_args)
 
-    def command(self, session_id):
+    def command(self, session_id, model=None):
         # The bubblewrap sandbox cannot start on hosts that forbid unprivileged
         # user namespaces; Eivoh runs the executor like Claude's bypass mode.
         args = [self.binary, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
-        if self.model:
-            args += ["-m", self.model]
+        model = model or self.model
+        if model:
+            args += ["-m", model]
         # All options precede `resume`: `exec resume` rejects some exec options
         # (--add-dir, -p, --color), but accepts them before the subcommand.
         args += list(self.extra_args)
@@ -103,9 +104,9 @@ class CodexExecutor(CliExecutor):
     def parser(self):
         return CodexParser()
 
-    def effective_model(self):
-        if self.model:
-            return self.model
+    def effective_model(self, model=None):
+        if model or self.model:
+            return model or self.model
         # Without -m, codex uses the model from its own config.
         path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
         try:

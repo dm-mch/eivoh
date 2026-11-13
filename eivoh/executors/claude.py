@@ -69,13 +69,14 @@ class ClaudeExecutor(CliExecutor):
         super().__init__(workdir, binary, model, grace, extra_args)
         self.permission_mode = permission_mode
 
-    def command(self, session_id):
+    def command(self, session_id, model=None):
         args = [self.binary, "-p", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages", "--permission-mode", self.permission_mode]
         if session_id:
             args += ["--resume", session_id]
-        if self.model:
-            args += ["--model", self.model]
+        model = model or self.model
+        if model:
+            args += ["--model", model]
         return args + list(self.extra_args)
 
     def environment(self):

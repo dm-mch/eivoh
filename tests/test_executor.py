@@ -166,3 +166,18 @@ async def test_supervisors_isolate_concurrent_turns(rig):
         await executor.shutdown()
         await asyncio.gather(first, second)
     assert other_pid not in process_table()
+
+
+async def test_turn_model_overrides_default_on_start_and_resume(rig):
+    _, _, executor, _, path = rig
+    executor.model = 'configured-default'
+    records = [r async for r in executor.start(100, 'first', model='claude-haiku-5-5')]
+    sid = next(e.session_id for r in records for e in r.events if e.kind == 'session_started')
+    resumed = [r async for r in executor.resume(101, sid, 'second', model='claude-sonnet-5-5')]
+    logs = [json.loads(line) for line in (path / 'prompts.jsonl').read_text().splitlines()]
+    for records, log, model in zip([records, resumed], logs, ['claude-haiku-5-5', 'claude-sonnet-5-5']):
+        assert log['args'][log['args'].index('--model') + 1] == model
+        assert next(r.payload['model'] for r in records if r.stream == 'meta') == model
+    assert logs[1]['resume'] == sid
+    assert executor.model == 'configured-default'
+    assert executor.command(None)[-2:] == ['--model', 'configured-default']

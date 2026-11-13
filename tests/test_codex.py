@@ -143,3 +143,109 @@ async def test_unknown_executor_is_refused(codex_rig):
     await gateway.idle()
     assert any('Unknown executor `gemini`' in text for _, text in channel.sent)
     assert storage.pending() == []
+
+
+async def test_codex_turn_model_override_and_meta(codex_rig):
+    _, _, codex, _, log = codex_rig
+    codex.model = 'configured-default'
+    first = [r async for r in codex.start(100, 'one', model='gpt-6.1-sol')]
+    sid = next(e.session_id for r in first for e in r.events if e.kind == 'session_started')
+    second = [r async for r in codex.resume(101, sid, 'two', model='gpt-6-astra')]
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    for records, call, model in zip([first, second], calls, ['gpt-6.1-sol', 'gpt-6-astra']):
+        assert call['args'][call['args'].index('-m') + 1] == model
+        assert next(r.payload['model'] for r in records if r.stream == 'meta') == model
+    assert calls[1]['args'][-3:] == ['resume', sid, '-']
+    assert codex.model == 'configured-default'
+    assert 'configured-default' in codex.command(None)
+
+
+def model_cache(path):
+    path.write_text(json.dumps({'models': [
+        {'slug': slug, 'visibility': 'list', 'description': slug}
+        for slug in ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol']]}))
+
+
+async def test_model_cross_executor_handoff_and_resume(codex_rig, tmp_path):
+    gateway, storage, _, channel, log = codex_rig
+    model_cache(tmp_path / 'models_cache.json')
+    await gateway.receive(inbound(1, 'remember violet'))
+    await gateway.idle()
+    original = storage.turn_for(1)
+    await gateway.receive(inbound(2, '/model astra'))
+    await gateway.idle()
+    task = storage.active_task(original['conversation_id'])
+    assert task['id'] == original['task_id']
+    assert task['executor'] == 'codex' and task['model'] == 'gpt-6-astra'
+    assert task['session_id'] is None
+    assert storage.turn_for(2) is None
+    assert any('transcript of 1 earlier turns' in text for _, text in channel.sent)
+    await gateway.receive(inbound(3, 'what word?'))
+    await gateway.receive(inbound(4, '/model gpt-6.1-sol'))
+    await gateway.receive(inbound(5, 'another question'))
+    await gateway.idle()
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert 'resume' not in calls[0]['args']
+    assert 'User:\nremember violet' in calls[0]['prompt']
+    assert 'Assistant:\nWorking done: remember violet' in calls[0]['prompt']
+    assert calls[0]['prompt'].endswith('Current request:\nwhat word?')
+    assert calls[1]['prompt'] == 'another question'
+    assert calls[1]['args'][-3:] == ['resume', storage.turn_for(3)['session_id'], '-']
+    assert calls[0]['args'][calls[0]['args'].index('-m') + 1] == 'gpt-6-astra'
+    assert calls[1]['args'][calls[1]['args'].index('-m') + 1] == 'gpt-6.1-sol'
+    assert storage.turn_for(3)['session_id'] == storage.turn_for(5)['session_id']
+    assert storage.turn_for(1)['session_id'] == original['session_id']
+    # Switching back also starts a new native session, carrying the task history.
+    await gateway.receive(inbound(6, '/model sonnet'))
+    await gateway.receive(inbound(7, 'back on claude'))
+    await gateway.idle()
+    claude_calls = [json.loads(line) for line in (tmp_path / 'prompts.jsonl').read_text().splitlines()]
+    assert claude_calls[-1]['resume'] is None
+    assert 'User:\nremember violet' in claude_calls[-1]['prompt']
+    assert 'Assistant:\necho:' in claude_calls[-1]['prompt']
+    assert claude_calls[-1]['prompt'].endswith('Current request:\nback on claude')
+
+
+@pytest.mark.parametrize('started', [False, True])
+async def test_model_handoff_survives_reopen_before_session(codex_rig, tmp_path, started):
+    from eivoh.storage import Storage
+    gateway, storage, codex, channel, log = codex_rig
+    model_cache(tmp_path / 'models_cache.json')
+    await gateway.receive(inbound(1, 'remember violet'))
+    await gateway.receive(inbound(2, '/model astra'))
+    await gateway.idle()
+    row = storage.journal(inbound(3, 'continue after restart'))
+    if started:
+        storage.claim(row['id'], 3)  # Crash before the new CLI emits a session.
+    await gateway.shutdown()
+    reopened = Storage(tmp_path / 'state.db')
+    new = Gateway(reopened, gateway.executor, {'fake': channel}, executors={'codex': codex}, edit_interval=0)
+    try:
+        await new.start()
+        await new.idle()
+        call = json.loads(log.read_text())
+        assert 'resume' not in call['args'] and 'gpt-6-astra' in call['args']
+        assert 'User:\nremember violet' in call['prompt']
+        assert call['prompt'].endswith('Current request:\ncontinue after restart')
+        assert reopened.turn_for(3)['status'] == 'completed'
+        assert reopened.turn_for(3)['recovery_count'] == int(started)
+    finally:
+        await new.shutdown()
+        reopened.close()
+
+
+async def test_model_errors_leave_task_and_queue_intact(codex_rig, tmp_path):
+    gateway, storage, _, channel, log = codex_rig
+    model_cache(tmp_path / 'models_cache.json')
+    await gateway.receive(inbound(1, '/model opus'))
+    await gateway.idle()
+    original = dict(storage.active_task(1))
+    await gateway.receive(inbound(2, '/model sol'))
+    await gateway.receive(inbound(3, '/model missing'))
+    await gateway.receive(inbound(4, '/model 9'))
+    await gateway.idle()
+    assert dict(storage.active_task(1)) == original
+    assert not storage.pending() and not log.exists()
+    assert any('Ambiguous' in text and 'gpt-6.1-sol' in text for _, text in channel.sent)
+    assert any('Unknown model' in text for _, text in channel.sent)
+    assert any('list numbered choices first' in text for _, text in channel.sent)
