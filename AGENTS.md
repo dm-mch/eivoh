@@ -11,7 +11,7 @@ See [ROADMAP.md](ROADMAP.md) for the current stage and what already works. The c
    * Components, channels, executors, code: [ARCHITECTURE.md](ARCHITECTURE.md).
    * Reflection, self-modification, checking changes, recovery: [EVOLUTION.md](EVOLUTION.md).
    * Memory design, record contents and a sample record: [EXPERIENCE.md](EXPERIENCE.md).
-   * Past experience: [private/experience/index.md](private/experience/index.md), then follow the links to the records relevant to the task.
+   * Project memory, before acting: [private/README.md](private/README.md) for the owner's rules and skills that apply to the task, and [private/experience/index.md](private/experience/index.md) for past experience; then follow the links to the files relevant to the task.
 2. Check the actual structure, the state of changes and the instructions in force in the repository. Preserve other people's edits. Do not treat open architectural questions as decisions already made.
 3. Define the goal, the constraints, the chosen approach and the expected result. For a substantial task, briefly record your expectations for success, quality, cost and difficulty. Name the model if it is known. Mark unavailable information and uncertainty explicitly.
 
