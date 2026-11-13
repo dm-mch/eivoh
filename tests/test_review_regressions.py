@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -85,8 +86,19 @@ async def test_shutdown_before_executor_exit_stays_recoverable(rig, ending):
     assert turn['status'] == 'running'
     assert storage.inbound(1)['state'] == 'running'
     assert storage.stored_result(turn['id']) is None
-    if ending != 'exception':
-        assert storage.db.execute('SELECT COUNT(*) FROM raw_event').fetchone()[0] == 1
+    records = storage.db.execute('SELECT * FROM raw_event WHERE turn_id=? ORDER BY sequence',
+                                 (turn['id'],)).fetchall()
+    prompts = [record for record in records if record['stream'] == 'meta']
+    assert len(prompts) == 1
+    assert json.loads(prompts[0]['payload']) == {
+        'type': 'turn_prompt', 'prompt': 'keep this request'}
+    physical = [record for record in records if record['stream'] == 'stdout']
+    assert len(physical) == (0 if ending == 'exception' else 1)
+    for record in physical:
+        assert record['raw_line'] is not None
+        assert record['sequence'] > prompts[0]['sequence']
+        assert not any(event['kind'] in {'error', 'turn_completed'}
+                       for event in json.loads(record['events']))
 
 
 async def test_final_delivery_honours_backoff_over_ten_seconds():
