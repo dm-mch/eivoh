@@ -1,4 +1,4 @@
-"""Explicit opt-in only. Uses subscription Claude; never contacts Telegram."""
+"""Explicit opt-in only. Uses subscription CLIs; never contacts Telegram."""
 import asyncio
 import json
 import os
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from conftest import FakeChannel, inbound, until
-from eivoh.executors.claude import ClaudeExecutor, process_table
+from eivoh.executors.claude import ClaudeStreamExecutor, process_table
 from eivoh.gateway import Gateway
 from eivoh.storage import Storage
 
@@ -16,7 +16,7 @@ from eivoh.storage import Storage
 @pytest.mark.skipif(os.environ.get('EIVOH_LIVE') != '1', reason='Set EIVOH_LIVE=1 to run real Claude')
 async def test_live_turn_resume_and_cancel(tmp_path):
     store = Storage(tmp_path / 'live.db')
-    executor = ClaudeExecutor(tmp_path, os.environ.get('EIVOH_CLAUDE_BIN', 'claude'), model='haiku')
+    executor = ClaudeStreamExecutor(tmp_path, os.environ.get('EIVOH_CLAUDE_BIN', 'claude'), model='haiku')
     channel = FakeChannel()
     gateway = Gateway(store, executor, {'fake': channel}, edit_interval=0.2)
     try:
@@ -61,9 +61,9 @@ async def test_live_turn_resume_and_cancel(tmp_path):
 @pytest.mark.live
 @pytest.mark.skipif(os.environ.get('EIVOH_LIVE') != '1', reason='Set EIVOH_LIVE=1 to run real Codex')
 async def test_live_codex_turn_resume_and_cancel(tmp_path):
-    from eivoh.executors.codex import CodexExecutor
+    from eivoh.executors.codex_app import CodexAppExecutor
     store = Storage(tmp_path / 'live.db', 'codex')
-    executor = CodexExecutor(tmp_path, os.environ.get('EIVOH_CODEX_BIN', 'codex'), model='gpt-6.1-sol',
+    executor = CodexAppExecutor(tmp_path, os.environ.get('EIVOH_CODEX_BIN', 'codex'), model='gpt-6.1-sol',
                              extra_args=('-c', 'model_reasoning_effort="low"'))
     channel = FakeChannel()
     gateway = Gateway(store, executor, {'fake': channel}, edit_interval=0.2)

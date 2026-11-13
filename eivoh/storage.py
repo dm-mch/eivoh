@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
+import uuid
 
 from .channels.base import Inbound
 from .executors.base import Record
@@ -91,6 +92,16 @@ MIGRATIONS = (
         # have been explicitly chosen. Preserve all existing tasks conservatively.
         "UPDATE task SET title_source='manual'",
     ),
+    (
+        "ALTER TABLE turn ADD COLUMN force_queue INTEGER NOT NULL DEFAULT 0",
+        """CREATE TABLE steering (
+            inbound_id INTEGER PRIMARY KEY REFERENCES inbound,
+            parent_turn_id INTEGER NOT NULL REFERENCES turn,
+            input_id TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL CHECK(state IN ('sending','accepted','queued','unknown')),
+            detail TEXT NOT NULL DEFAULT '')""",
+        "CREATE INDEX steering_parent ON steering(parent_turn_id,state)",
+    ),
 )
 
 
@@ -139,13 +150,14 @@ class Storage:
             inbound_id = cur.lastrowid
             # Unknown slash text (a path, an executor's own command) is an ordinary
             # message. A button press is always a command; the gateway rejects unknown ones.
-            if not (message.button or command(message.text) in COMMANDS):
+            if not (message.button or command(message.text) in COMMANDS) or (command(message.text) == '/q' and len(message.text.split(maxsplit=1)) == 2):
                 target = self.reply_task(conv, message.reply_to) or self.active_task(conv)
                 task_id = target['id'] if target else self._create_task(conv)
                 title = default_title(message.text)
                 self.db.execute("UPDATE task SET status='active',title=COALESCE(title,?),last_active=? WHERE id=?",
                                 (title, now(), task_id))
-                self.db.execute("INSERT INTO turn(inbound_id,conversation_id,task_id) VALUES (?,?,?)", (inbound_id, conv, task_id))
+                self.db.execute("INSERT INTO turn(inbound_id,conversation_id,task_id,force_queue) VALUES (?,?,?,?)",
+                                (inbound_id, conv, task_id, command(message.text) == '/q'))
         return self.inbound(inbound_id)
 
     def inbound(self, inbound_id):
@@ -164,8 +176,70 @@ class Storage:
 
     def pending_task(self, task_id):
         return self.db.execute("SELECT inbound.* FROM inbound JOIN turn ON turn.inbound_id=inbound.id "
-                               "WHERE turn.task_id=? AND turn.status IN ('queued','running') ORDER BY inbound.id",
+                               "WHERE turn.task_id=? AND turn.status IN ('queued','running') AND NOT EXISTS "
+                               "(SELECT 1 FROM steering WHERE inbound_id=inbound.id AND state IN ('sending','accepted')) ORDER BY inbound.id",
                                (task_id,)).fetchall()
+
+    def steering(self, inbound_id):
+        return self.db.execute("SELECT * FROM steering WHERE inbound_id=?", (inbound_id,)).fetchone()
+
+    def reserve_steer(self, parent_id, inbound_id):
+        """Claim only the first queued input, with unchanged launch settings."""
+        with self.db:
+            parent = self.db.execute("SELECT * FROM turn WHERE id=?", (parent_id,)).fetchone()
+            child = self.turn_for(inbound_id)
+            task = self.task(parent['conversation_id'], parent['task_id'])
+            if (parent['status'] != 'running' or child['status'] != 'queued' or child['force_queue'] or
+                    self.steering(inbound_id) or parent['executor'] != task['executor'] or parent['model'] != task['model']):
+                return None
+            earlier = self.db.execute("SELECT 1 FROM turn WHERE task_id=? AND inbound_id<? AND id!=? "
+                "AND status IN ('queued','running') AND NOT EXISTS (SELECT 1 FROM steering "
+                "WHERE inbound_id=turn.inbound_id AND (state='accepted' OR (state='sending' AND parent_turn_id=?)))",
+                (parent['task_id'], inbound_id, parent_id, parent_id)).fetchone()
+            if earlier:
+                return None
+            input_id = str(uuid.uuid4())
+            self.db.execute("INSERT INTO steering(inbound_id,parent_turn_id,input_id,state) VALUES (?,?,?,'sending')",
+                            (inbound_id, parent_id, input_id))
+            self.db.execute("UPDATE turn SET executor=?,model=? WHERE id=?", (parent['executor'], parent['model'], child['id']))
+            return input_id
+
+    def steer_outcome(self, inbound_id, status, detail=''):
+        with self.db:
+            # Acceptance evidence wins over a concurrent timeout/shutdown.
+            changed = self.db.execute("UPDATE steering SET state=?,detail=? WHERE inbound_id=? AND state!='accepted'",
+                                     (status, detail, inbound_id)).rowcount
+            if changed and status in {'queued', 'unknown'}:
+                self.db.execute("UPDATE turn SET executor=NULL,model=NULL WHERE inbound_id=? AND status='queued'", (inbound_id,))
+
+    def recover_steering(self):
+        with self.db:
+            self.db.execute("UPDATE steering SET state='unknown',detail='Service restarted before acknowledgement' WHERE state='sending'")
+            self.db.execute("UPDATE turn SET executor=NULL,model=NULL WHERE status='queued' AND inbound_id IN "
+                            "(SELECT inbound_id FROM steering WHERE state='unknown')")
+
+    def input_text(self, inbound_id):
+        row = self.inbound(inbound_id)
+        turn = self.turn_for(inbound_id)
+        text = row['text'].split(maxsplit=1)[1] if turn['force_queue'] else row['text']
+        delivery = self.steering(inbound_id)
+        if delivery and delivery['state'] == 'unknown':
+            text = ("Eivoh could not confirm delivery of this clarification during the previous run. "
+                    "It may already be in this session or have been acted on. Check existing context and work; "
+                    "do not repeat completed actions. Ensure this user request is handled:\n\n" + text)
+        return text
+
+    def accepted_inputs(self, turn_id):
+        return self.db.execute("SELECT inbound.id,inbound.text FROM inbound JOIN steering ON steering.inbound_id=inbound.id "
+                               "WHERE parent_turn_id=? AND steering.state='accepted' ORDER BY inbound.id", (turn_id,)).fetchall()
+
+    def recovery_inputs(self, turn_id):
+        rows = self.accepted_inputs(turn_id)
+        if not rows:
+            return ''
+        return ("\n\nThe following additional user inputs were accepted by the executor during the interrupted run. "
+                "They are already part of this session; retain their instructions without repeating completed actions:\n\n" +
+                '\n\n'.join(row['text'] for row in rows))
 
     def claim(self, inbound_id, max_recoveries):
         with self.db:
@@ -198,6 +272,17 @@ class Storage:
                             (turn_id, seq, record.stream, record.raw_line, json.dumps(record.payload), json.dumps([e.kind for e in record.events]), json.dumps([{"kind": e.kind, "data": e.data} for e in record.events
                                         if allow_result or e.kind not in {"error", "turn_completed"}])))
             for event in record.events:
+                if event.kind == 'input_accepted' and not event.data.get('initial'):
+                    accepted = self.db.execute("UPDATE steering SET state='accepted',detail='' WHERE parent_turn_id=? AND input_id=? "
+                                               "AND state IN ('sending','unknown')", (turn_id, event.data['input_id'])).rowcount
+                    if accepted:
+                        # A timeout may have cleared launch settings for fallback
+                        # before a buffered acknowledgement reaches the journal.
+                        # Restore the actual accepting run, never current /model.
+                        self.db.execute("UPDATE turn SET executor=(SELECT executor FROM turn WHERE id=?),"
+                            "model=(SELECT model FROM turn WHERE id=?) WHERE inbound_id="
+                            "(SELECT inbound_id FROM steering WHERE input_id=?) AND status IN ('queued','cancelled')",
+                            (turn_id, turn_id, event.data['input_id']))
                 if event.session_id:
                     self.db.execute("UPDATE turn SET session_id=? WHERE id=?", (event.session_id, turn_id))
                     self.db.execute("""INSERT INTO task_session(task_id,executor,session_id)
@@ -212,14 +297,47 @@ class Storage:
         # Only a turn that observed the session has shown it the request; a failed
         # launch must not hide turns the session has still not seen.
         if turn['executor'] and turn['session_id']:
+            # Legacy adapters report a session only after receiving their stdin
+            # prompt. App-server can open a thread while turn/start still fails.
+            # Fold attempts in order: an older acceptance cannot acknowledge a
+            # new attempt, and ordinary steering acknowledgements do not count.
+            initial_accepted = True
+            for row in self.db.execute("SELECT events FROM raw_event WHERE turn_id=? AND "
+                "(kinds LIKE '%\"session_started\"%' OR kinds LIKE '%\"input_accepted\"%') ORDER BY sequence", (turn['id'],)):
+                for event in json.loads(row[0]):
+                    if event['kind'] == 'session_started':
+                        initial_accepted = event['data'].get('input_accepted', True)
+                    elif event['kind'] == 'input_accepted' and event['data'].get('initial'):
+                        initial_accepted = True
+            if not initial_accepted:
+                return
+            watermark = max([turn['inbound_id'], *(row['id'] for row in self.accepted_inputs(turn['id']))])
+            for row in self.db.execute("SELECT payload FROM raw_event WHERE turn_id=? AND stream='meta'", (turn['id'],)):
+                payload = json.loads(row[0])
+                if isinstance(payload, dict) and payload.get('type') == 'turn_prompt':
+                    watermark = max(watermark, payload.get('context_through', 0))
+                    break
+            blocked = self.db.execute("SELECT MIN(inbound_id) FROM turn WHERE task_id=? AND inbound_id<=? "
+                "AND id!=? AND status IN ('queued','running') AND NOT EXISTS "
+                "(SELECT 1 FROM steering WHERE inbound_id=turn.inbound_id AND state='accepted')",
+                (turn['task_id'], watermark, turn['id'])).fetchone()[0]
+            if blocked is not None:
+                watermark = min(watermark, blocked - 1)
             self.db.execute("UPDATE task_session SET synced_inbound_id=MAX(synced_inbound_id,?) WHERE task_id=? AND executor=?",
-                            (turn['inbound_id'], turn['task_id'], turn['executor']))
+                            (watermark, turn['task_id'], turn['executor']))
 
     def finish(self, turn_id, status, error=None):
         with self.db:
             turn = self.db.execute("SELECT * FROM turn WHERE id=?", (turn_id,)).fetchone()
             changed = self.db.execute("UPDATE turn SET status=?,error=? WHERE id=? AND status IN ('queued','running')", (status, error, turn_id)).rowcount
             if changed:
+                children = self.db.execute("SELECT turn.id FROM turn JOIN steering ON steering.inbound_id=turn.inbound_id "
+                                          "WHERE parent_turn_id=? AND steering.state='accepted'", (turn_id,)).fetchall()
+                for child in children:
+                    self.db.execute("UPDATE turn SET status=?,session_id=?,error=? WHERE id=? AND status='queued'",
+                                    (status, turn['session_id'], error, child['id']))
+                    self.db.execute("UPDATE inbound SET state=? WHERE id=(SELECT inbound_id FROM turn WHERE id=?) AND state!='cancelled'",
+                                    ('cancelled' if status == 'cancelled' else 'done', child['id']))
                 self._sync(turn)
                 self.db.execute("UPDATE task SET last_active=? WHERE id=?", (now(), turn['task_id']))
             self.db.execute("UPDATE inbound SET state=? WHERE id=(SELECT inbound_id FROM turn WHERE id=?) AND state != 'cancelled'",
@@ -368,17 +486,22 @@ class Storage:
         """Recent whole turns, or excerpts of the newest oversized turn."""
         limit = max(0, limit)
         blocks, size, truncated, newest = [], 0, False, None
-        rows = self.db.execute("SELECT turn.id,inbound.text FROM turn JOIN inbound ON inbound.id=turn.inbound_id "
-                               "WHERE turn.task_id=? AND turn.inbound_id<? AND turn.inbound_id>? AND (turn.status IN ('completed','failed') "
+        rows = self.db.execute("SELECT turn.id,turn.inbound_id,inbound.text FROM turn JOIN inbound ON inbound.id=turn.inbound_id "
+                               "WHERE turn.task_id=? AND turn.inbound_id<? AND (turn.inbound_id>? OR EXISTS "
+                               "(SELECT 1 FROM steering WHERE parent_turn_id=turn.id AND state='accepted' AND inbound_id>?)) "
+                               "AND NOT EXISTS (SELECT 1 FROM steering WHERE inbound_id=turn.inbound_id AND state='accepted') AND (turn.status IN ('completed','failed') "
                                "OR (turn.status='cancelled' AND EXISTS (SELECT 1 FROM raw_event WHERE turn_id=turn.id))) "
                                "ORDER BY turn.inbound_id DESC",
-                               (task_id, before_inbound_id, after_inbound_id))
+                               (task_id, before_inbound_id, after_inbound_id, after_inbound_id))
         for row in rows:
             result = self.stored_result(row["id"])
             answer = result[0] if result is not None else "[No stored final answer.]"
+            inputs = ([row['text']] if row['inbound_id'] > after_inbound_id else [])
+            inputs += [item['text'] for item in self.accepted_inputs(row['id']) if item['id'] > after_inbound_id]
+            user = '\n\nUser (during the same turn):\n'.join(inputs)
             if newest is None:
-                newest = (row['text'], answer)
-            block = f"User:\n{row['text']}\n\nAssistant:\n{answer}\n\n"
+                newest = (user, answer)
+            block = f"User:\n{user}\n\nAssistant:\n{answer}\n\n"
             if size + len(block) > limit:
                 truncated = True
                 break
@@ -413,30 +536,48 @@ class Storage:
                       "conversation's history:" if self.session(turn['task_id'], turn['executor'])
                       else "Earlier conversation in this task (transcript from Eivoh):")
             prompt = f"{header}\n\n{transcript}End of transcript.\n\nCurrent request:\n{request}"
-        self.append(turn['id'], Record(None, {'type': 'turn_prompt', 'prompt': prompt}, stream='meta'))
+        # A previous run may have accepted input N+1 while delivery of N stayed
+        # uncertain. When N later runs (possibly with a different executor), its
+        # history must include that whole completed run, including N+1. Record
+        # that progress so switching back never drops or replays that fragment.
+        context_through = self.db.execute("SELECT COALESCE(MAX(steering.inbound_id),0) FROM steering JOIN turn parent "
+            "ON parent.id=parent_turn_id WHERE parent.task_id=? AND parent.inbound_id<? "
+            "AND parent.status IN ('completed','failed','cancelled') AND steering.state='accepted'",
+            (turn['task_id'], turn['inbound_id'])).fetchone()[0]
+        metadata = {'type': 'turn_prompt', 'prompt': prompt}
+        if context_through > turn['inbound_id']:
+            metadata['context_through'] = context_through
+        self.append(turn['id'], Record(None, metadata, stream='meta'))
         return prompt
 
     def stored_result(self, turn_id):
         """Replay normalized events after a crash, without invoking the executor."""
         text, error, completed, deltas = "", None, False, False
+        parts = {}  # Complete parts survive attempts; partial streaming text does not.
         for row in self.db.execute("SELECT events FROM raw_event WHERE turn_id=? ORDER BY sequence", (turn_id,)):
             for event in json.loads(row[0]):
                 kind, data = event["kind"], event["data"]
                 if kind == "session_started":
                     # Each resumed attempt has its own output and errors.
                     text, error, completed, deltas = "", None, False, False
+                elif kind == 'answer_part':
+                    parts[data['id']] = data['text']
                 elif kind == "text_delta":
-                    text += data["text"]
+                    text = data['text'] if data.get('replace') else text + data['text']
                     deltas = True
                 elif kind == "message":
-                    if not deltas:
+                    if data.get('replace'):
+                        text = data['text']
+                    elif not deltas:
                         text += data["text"]
                     deltas = False
                 elif kind == "error":
                     error = error or str(data.get("message", "Executor error"))
                 elif kind == "turn_completed":
                     completed = True
-                    text = data.get("text") or text
+                    included = set(data.get('answer_part_ids', ()))
+                    previous = [part for part_id, part in parts.items() if part_id not in included]
+                    text = '\n\n'.join(part for part in [*previous, data.get('text') or text] if part)
                     if data["status"] != "completed" and error is None:
                         error = "Executor reported failure"
         return (text, error) if completed else None
@@ -465,7 +606,7 @@ class Storage:
         return [(t['id'], t['task_id']) for t in turns if t['status'] == 'running'], sum(t['status'] == 'queued' for t in turns)
 
 
-COMMANDS = frozenset({'/new', '/tasks', '/task', '/model', '/stop', '/close', '/title'})
+COMMANDS = frozenset({'/new', '/tasks', '/task', '/model', '/stop', '/close', '/title', '/q'})
 
 
 def now():

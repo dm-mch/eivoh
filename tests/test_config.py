@@ -120,3 +120,34 @@ def test_parallel_config(monkeypatch, tmp_path, value, expected):
             Config.from_env()
     else:
         assert Config.from_env().max_parallel == expected
+
+
+@pytest.mark.parametrize('value', ['--add-dir /tmp', '-p profile', '-s read-only', '--search', '--skip-git-repo-check',
+                                   '--ignore-user-config', '-i image.png', '--help', '--startup-sign-out'])
+def test_codex_exec_options_fail_at_config_loading(monkeypatch, tmp_path, value):
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
+    monkeypatch.setenv('EIVOH_CODEX_ARGS', value)
+    with pytest.raises(ValueError, match='now configures app-server.*not supported'):
+        Config.from_env()
+
+
+@pytest.mark.parametrize('value', ['-c x=true --enable feature --disable other --strict-config',
+                                   '--config=x=true --enable=feature --disable=other', '--strict-config'])
+def test_codex_supported_app_server_options(monkeypatch, tmp_path, value):
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
+    monkeypatch.setenv('EIVOH_CODEX_ARGS', value)
+    assert Config.from_env().codex_args
+
+
+@pytest.mark.parametrize('value', ['-c', '--config=missing-equals', '--enable', '--disable=', '--enable --strict-config'])
+def test_codex_app_server_option_missing_values(monkeypatch, tmp_path, value):
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
+    monkeypatch.setenv('EIVOH_CODEX_ARGS', value)
+    with pytest.raises(ValueError, match='requires'):
+        Config.from_env()

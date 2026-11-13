@@ -94,18 +94,30 @@ For the systemd environment file, use the same quoted value without `export`.
 Codex is the second executor (installed `codex` CLI with ChatGPT login). A task
 initially uses the executor chosen by `/new codex` or `/new claude`; plain
 `/new` and the first task use `EIVOH_DEFAULT_EXECUTOR` (default `claude`). Each
-turn runs `codex exec --json --dangerously-bypass-approvals-and-sandbox ... -` (or
-`codex exec ... resume <thread_id> -`; all options precede `resume`) in `EIVOH_WORKDIR`, with the prompt on
-stdin. The Codex sandbox is bypassed like Claude's default permission mode; on
-hosts that forbid unprivileged user namespaces its bubblewrap sandbox cannot
-start anyway. Inherited `OPENAI_*` and `CODEX_API_KEY` variables are removed so
-the subscription login is used. `EIVOH_CODEX_ARGS` (shlex-split, for example
-`-c model_reasoning_effort="high"`) is appended on start and resume; `exec`,
-`resume`, `--json`, `-C`/`--cd` and `-m`/`--model` are rejected. Set model defaults
-with `EIVOH_CLAUDE_MODEL` or `EIVOH_CODEX_MODEL`, so extra arguments cannot override
-the task's model selection. Codex sends whole messages, not
-text deltas, so its answer grows message by message; the final answer is its
-last message.
+turn runs a local `codex app-server --listen stdio://` subprocess in
+`EIVOH_WORKDIR`. Eivoh starts or resumes its native thread, streams answer deltas,
+and injects clarifications through `turn/steer`. Existing threads created by
+`codex exec` are resumed without resetting them. Each run has its own supervised
+process; no remote server is involved. The Codex sandbox is bypassed like
+Claude's default permission mode. Inherited `OPENAI_*` and `CODEX_API_KEY`
+variables are removed so the subscription login is used. `EIVOH_CODEX_ARGS`
+(shlex-split, for example `-c model_reasoning_effort="high"`) supplies app-server
+options: `-c/--config key=value`, `--enable feature`, `--disable feature`, and
+`--strict-config`. Adapter-owned subcommands, transport and model flags are rejected.
+When upgrading from the exec adapter, migrate exec-only options such as `-p`,
+`--add-dir`, `--search` or `--ignore-user-config` to supported configuration
+overrides; unsupported options now fail clearly at configuration loading.
+Set model defaults with `EIVOH_CLAUDE_MODEL` or `EIVOH_CODEX_MODEL`.
+Codex text is grouped by message ID; all completed final-answer parts are retained
+once, in order, while commentary is omitted from the stored final answer.
+The isolated title generator continues to use the one-shot `codex exec` runner.
+
+Claude ordinary tasks keep stream-json stdin open and correlate replayed user
+messages by stable UUID. The one-shot Claude runner remains available for the
+isolated title generator. If a submitted clarification crosses a result boundary,
+the combined answer retains the complete answer before it and the follow-up.
+Complete answer parts are journaled separately from partial streaming text, so a
+restart between parts preserves them in the displayed answer and later history.
 
 `/model` shows the active task's executor and selected model (`default` means
 the executor's configured default), followed by a numbered catalog grouped by
@@ -155,12 +167,13 @@ Chat commands:
   are preserved. Otherwise its first message supplies a temporary title: voice
   prefix removed, whitespace collapsed, shortened to 40 characters.
 * `/model [name or number]` shows or changes the target task's model as described above.
+* `/q <text>` queues a message after the running turn and earlier queued messages.
 
 For `/stop`, `/close`, `/model` and `/title`, an explicit task number (where the
 syntax allows one) takes priority, then a replied-to task, then the current task.
 The number in `/model` selects a model, not a task. Unknown task numbers and tasks
 from another conversation are refused. Tasks are never automatically closed.
-Telegram registers new, tasks, model, stop, close and title in its command menu;
+Telegram registers new, tasks, model, stop, q, close and title in its command menu;
 inline button commands use the same validation and durable deduplication as typing.
 
 After a new task's first successful text answer, a background request generates
@@ -230,15 +243,28 @@ have not been exercised by this review-fix task.
 
 Messages become turns bound to a task when journaled; that binding never changes.
 A reply to a known owner message, or to any part of an answer or task-specific
-notice, goes to that task and reopens it if closed. Only the seven commands above
+notice, goes to that task and reopens it if closed. Only the commands above
 are commands: other text starting with `/` (a path, an executor's own command) is
 an ordinary message. Unknown reply targets fall
 back to the current task. With neither a known target nor a current task, a new
 current task is created. Reply routing itself does not switch the current task.
+Ordinary messages to a running task add clarifications to that run when its
+executor/model still matches the task's selection. The chat confirms only after
+the executor acknowledges the input before the reader sees the turn end; this
+confirms receipt, not completion of its instructions. A late acknowledgement stays
+uncertain and cannot attach the input to an already finished answer.
+Claude may acknowledge only after its current tool finishes.
+`/q <text>` keeps a message for the next turn. Later messages cannot jump an
+earlier queued input, and messages after a model change use the next turn.
+Messages arriving as a run ends safely stay queued. Commands themselves never
+steer. `/stop` remains the hard interrupt.
+
 Each task has its own FIFO queue and worker. Different tasks run concurrently,
 bounded globally by `EIVOH_MAX_PARALLEL` (default 3, integer at least 1); turns
 waiting for a slot stay queued. Commands run immediately in arrival order under
-the conversation lock, create no turns, and never wait behind executor work.
+the conversation lock and never wait behind executor work. `/q` journals its
+text as a queued turn; other commands create no turns. Steering acknowledgements
+and their notices run separately from polling and executor-slot accounting.
 Cancellation is committed before terminating the target task's process tree.
 Cancelled messages remain in the journal.
 
@@ -260,6 +286,10 @@ queued behind it would stay in the earlier task. The old task session column is
 retained but no longer read or updated.
 Migration 4 adds title provenance and a durable one-attempt marker. Because old
 titles lack provenance, all existing tasks are treated as manually named.
+Migration 5 adds explicit queue intent and steering delivery records linking each
+input to its parent turn. Raw acknowledgement and accepted state commit together.
+Accepted inputs join the parent transcript with one final answer and are never
+launched as separate turns. Sessions and title provenance remain intact.
 Older releases reject newer schema versions. A rollback needs a
 compatible release or a separately planned database restore.
 Conversations point to one current task among their open tasks; turns retain
@@ -286,6 +316,15 @@ reminder to check existing work when resuming. The assembled prompt, including
 any missed transcript, is journaled before launch and reused on recovery: a session
 ID alone does not acknowledge receipt of the first prompt. Legacy pending turns
 without prompt metadata reconstruct it using the session's transcript progress.
+Real isolated Gateway probes for both adapters covered steering, queue order,
+native resume, cleanup on stop, and recovery after durable input acceptance.
+These used a local channel; end-to-end Telegram steering remains unverified.
+
+Inputs with an uncertain delivery outcome remain queued with a visible notice;
+the next prompt explicitly asks the executor to check whether they were already
+handled. They may have been applied before the crash: exactly-once external
+effects cannot be guaranteed across an unacknowledged write. Accepted inputs
+remain associated with their parent and are retained in its recovery prompt.
 Three automatic recovery attempts are allowed
 per turn before visible failure. Errors/results emitted after shutdown begins
 remain in the raw journal but cannot finalize the interrupted turn on replay.
