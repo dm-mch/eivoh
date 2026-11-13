@@ -104,13 +104,16 @@ class CodexExecutor(CliExecutor):
     def parser(self):
         return CodexParser()
 
-    def effective_model(self, model=None):
-        if model or self.model:
-            return model or self.model
-        # Without -m, codex uses the model from its own config.
+    def model_metadata(self, model=None):
+        metadata = super().model_metadata(model)
+        if metadata['requested_model']:
+            return metadata
+        # A config hint only: profiles/CLI overrides may change the actual model.
         path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
         try:
             model = tomllib.loads(path.read_text()).get("model")
-        except (OSError, tomllib.TOMLDecodeError):
-            return None
-        return f"{model} (codex config)" if model else None
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return metadata
+        if isinstance(model, str) and model:
+            metadata.update(configured_model=model, configured_model_source='codex_config')
+        return metadata

@@ -120,8 +120,10 @@ entries with `visibility: "list"`; an unreadable cache gives an empty list.
 Model selection is stored per task. Within the same executor it keeps the native
 session; switching between Claude and Codex clears the session and starts a new
 one on the next message. Eivoh passes earlier user texts and stored final answers
-as a transcript, oldest first, capped at 30,000 characters by omitting oldest
-whole turns and marking truncation. This transfers conversation text, not native
+as a transcript, oldest first, capped at 30,000 characters including truncation
+markers. It prefers recent whole turns; if the newest turn cannot fit, it keeps
+the beginning and end of both user and assistant text with role labels and explicit
+omission markers. This transfers conversation text, not native
 tool/session state; turns without a stored final answer are marked as such.
 The switch reply reports the number of included turns. With no active task,
 selection creates one. Telegram's `/new`, `/model` and `/stop` menu is registered
@@ -178,7 +180,12 @@ changes use ordered transactional migrations and `PRAGMA user_version`; migratio
 1 assumes a new database, with no upgrade from the unreleased prototype layout.
 Migration 2 upgrades version 1 in place, adding a nullable task model.
 Conversations point to active tasks; tasks own executor/model choice and session ID;
-turns retain their observed session ID and raw events. Raw stdout
+turns retain their observed session ID and raw events. Launch metadata separates
+the requested model and its source from a configured-model hint (Codex config)
+and the observed model, which is unknown at launch. Claude's init and main assistant
+events retain model observations with their respective sources; an init report
+does not prove which model generated a response. Model IDs contain no source labels.
+Raw stdout
 and stderr lines are append-only; invalid UTF-8 uses replacement characters.
 SIGTERM marks shutdown before polling cleanup. `KillMode=mixed` lets the gateway
 stop executors before systemd's final cgroup kill. Each executor run has a small
@@ -191,7 +198,12 @@ provides an additional containment layer. Interrupted turns remain recoverable.
 Restart recovery finalizes a stored result and delivers its answer without
 launching the executor again. Otherwise it resumes the task session with the
 original request and a reminder to check existing work, or sends the original
-request when no session exists. Three automatic recovery attempts are allowed
+request when no session exists. The assembled original prompt, including any
+cross-executor transcript, is journaled before launch and reused on recovery:
+a session ID alone does not acknowledge receipt of the first prompt. Older pending
+turns without that metadata reconstruct the transcript when no earlier turn shares
+the resumed session; ordinary same-session resumes keep only the current request.
+Three automatic recovery attempts are allowed
 per turn before visible failure. Errors/results emitted after shutdown begins
 remain in the raw journal but cannot finalize the interrupted turn on replay.
 External tool effects are not exactly-once: an action may precede its persisted

@@ -184,8 +184,9 @@ class Storage:
         return self.active_task(row["conversation_id"]), switched
 
     def transcript(self, task_id, before_inbound_id, limit=30000):
-        """A bounded suffix of whole earlier turns, rendered oldest first."""
-        blocks, size, truncated = [], 0, False
+        """Recent whole turns, or excerpts of the newest oversized turn."""
+        limit = max(0, limit)
+        blocks, size, truncated, newest = [], 0, False, None
         rows = self.db.execute("SELECT turn.id,inbound.text FROM turn JOIN inbound ON inbound.id=turn.inbound_id "
                                "WHERE turn.task_id=? AND turn.inbound_id<? AND (turn.status IN ('completed','failed') "
                                "OR (turn.status='cancelled' AND EXISTS (SELECT 1 FROM raw_event WHERE turn_id=turn.id))) "
@@ -194,6 +195,8 @@ class Storage:
         for row in rows:
             result = self.stored_result(row["id"])
             answer = result[0] if result is not None else "[No stored final answer.]"
+            if newest is None:
+                newest = (row['text'], answer)
             block = f"User:\n{row['text']}\n\nAssistant:\n{answer}\n\n"
             if size + len(block) > limit:
                 truncated = True
@@ -202,11 +205,36 @@ class Storage:
             size += len(block)
         notice = ""
         if truncated:
-            notice = "[Transcript truncated: oldest turns omitted.]\n\n"[:limit]
+            notice = "[Transcript truncated: older turns or text omitted.]\n\n"[:limit]
             while blocks and size + len(notice) > limit:
                 size -= len(blocks.pop())
+            if not blocks and newest is not None:
+                block = excerpt_turn(*newest, limit - len(notice))
+                if block:
+                    blocks.append(block)
         text = notice + "".join(reversed(blocks))
         return text, len(blocks), truncated
+
+    def prepare_prompt(self, turn, request):
+        """Journal the original assembled input before launch; reuse on recovery."""
+        for row in self.db.execute("SELECT payload FROM raw_event WHERE turn_id=? AND stream='meta' ORDER BY sequence",
+                                   (turn['id'],)):
+            payload = json.loads(row[0])
+            if isinstance(payload, dict) and payload.get('type') == 'turn_prompt':
+                return payload['prompt']
+        # Old pending turns have no prompt record. A newly observed session is
+        # not proof that the first prompt (including its handoff) was received.
+        # An earlier turn sharing the session distinguishes an ordinary resume.
+        prior_session = turn['resume_id'] and self.db.execute(
+            "SELECT 1 FROM turn WHERE task_id=? AND inbound_id<? AND session_id=? LIMIT 1",
+            (turn['task_id'], turn['inbound_id'], turn['resume_id'])).fetchone()
+        prompt = request
+        if not prior_session:
+            transcript, _, _ = self.transcript(turn['task_id'], turn['inbound_id'])
+            if transcript:
+                prompt = f"Earlier conversation in this task (transcript from Eivoh):\n\n{transcript}End of transcript.\n\nCurrent request:\n{request}"
+        self.append(turn['id'], Record(None, {'type': 'turn_prompt', 'prompt': prompt}, stream='meta'))
+        return prompt
 
     def stored_result(self, turn_id):
         """Replay normalized events after a crash, without invoking the executor."""
@@ -251,3 +279,28 @@ class Storage:
 
 def command(text):
     return text.strip().split(maxsplit=1)[0].split("@", 1)[0] if text.strip() else ""
+
+
+def excerpt_turn(user, assistant, limit):
+    """Keep both roles and each text's beginning/end, including marker costs."""
+    marker = "\n[Text truncated]\n"
+    overhead = len("User:\n\n\nAssistant:\n\n\n")
+    budget = limit - overhead
+    minimum = [min(len(text), len(marker) + 2) for text in (user, assistant)]
+    if budget < sum(minimum):
+        return ""  # Too small to show both roles and honest excerpts.
+    user_budget = min(len(user), max(minimum[0], budget // 2))
+    assistant_budget = min(len(assistant), budget - user_budget)
+    if assistant_budget < minimum[1]:
+        user_budget -= minimum[1] - assistant_budget
+        assistant_budget = minimum[1]
+    user_budget = min(len(user), budget - assistant_budget)
+
+    def trim(text, available):
+        if len(text) <= available:
+            return text
+        keep = available - len(marker)
+        head = (keep + 1) // 2
+        return text[:head] + marker + text[-(keep - head):]
+
+    return f"User:\n{trim(user, user_budget)}\n\nAssistant:\n{trim(assistant, assistant_budget)}\n\n"

@@ -21,8 +21,9 @@ def _parse_line(line: str) -> Record:
         events.append(Event(kind, data, raw, sid))
 
     kind = raw.get("type")
-    if kind == "system" and raw.get("subtype") == "init":
-        add("session_started", session_id=sid)
+    if kind == "system" and raw.get("subtype") == "init" and not raw.get("parent_tool_use_id"):
+        add("session_started", session_id=sid, observed_model=raw.get("model"),
+            observed_model_source="system.init")
     elif kind == "stream_event":
         event = raw.get("event", {})
         # Subagent output is journaled but must not become the main answer.
@@ -35,7 +36,8 @@ def _parse_line(line: str) -> Record:
         message = raw.get("message", {})
         if kind == "assistant" and not raw.get("parent_tool_use_id"):
             add("message", text="".join(b.get("text", "") for b in message.get("content", []) if b.get("type") == "text"),
-                message_id=message.get("id"))
+                message_id=message.get("id"), observed_model=message.get("model"),
+                observed_model_source="assistant.message")
         for block in message.get("content", []):
             if block.get("type") == "tool_use":
                 add("tool_started", **block)

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -188,5 +189,75 @@ def test_recovery_routes_to_current_task_model_and_executor(tmp_path):
         assert recovered['session_id'] == 'old-session'  # Historical evidence only.
         assert recovered['resume_id'] is None
         assert (recovered['executor'], recovered['model']) == ('codex', 'gpt-6-astra')
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('user_size,assistant_size', [(40000, 40), (40, 40000), (40000, 40000)])
+def test_transcript_excerpts_oversized_newest_turn(tmp_path, user_size, assistant_size):
+    store = Storage(tmp_path / 'transcript.db')
+    try:
+        user = 'user beginning ' + 'u' * user_size + ' user ending'
+        assistant = 'answer beginning ' + 'a' * assistant_size + ' answer ending'
+        row = store.journal(inbound(1, user))
+        turn, _ = store.claim(row['id'], 3)
+        store.append(turn['id'], parse_line(json.dumps({'type': 'result', 'result': assistant})))
+        store.finish(turn['id'], 'completed')
+        text, count, truncated = store.transcript(turn['task_id'], 2)
+        assert len(text) <= 30000 and count == 1 and truncated
+        assert 'User:\nuser beginning ' in text and ' user ending\n\nAssistant:' in text
+        assert 'Assistant:\nanswer beginning ' in text and ' answer ending\n\n' in text
+        assert text.count('[Text truncated]') == int(user_size > 30000) + int(assistant_size > 30000)
+        for limit in range(0, 300):
+            bounded, count, truncated = store.transcript(turn['task_id'], 2, limit=limit)
+            assert len(bounded) <= limit and truncated
+            if count:
+                assert 'User:\n' in bounded and 'Assistant:\n' in bounded
+                assert '[Text truncated]' in bounded
+        # A newer small turn takes priority over the oversized older turn.
+        row = store.journal(inbound(2, 'recent question'))
+        latest, _ = store.claim(row['id'], 3)
+        store.append(latest['id'], parse_line('{"type":"result","result":"recent answer"}'))
+        store.finish(latest['id'], 'completed')
+        text, count, truncated = store.transcript(turn['task_id'], 3)
+        assert count == 1 and truncated
+        assert 'User:\nrecent question' in text and 'Assistant:\nrecent answer' in text
+    finally:
+        store.close()
+
+
+def test_legacy_ordinary_resume_does_not_reinject_history(tmp_path):
+    store = Storage(tmp_path / 'resume.db')
+    try:
+        first = store.journal(inbound(1, 'earlier request'))
+        turn, _ = store.claim(first['id'], 3)
+        session = parse_line('{"type":"system","subtype":"init","session_id":"same-session"}')
+        store.append(turn['id'], session)
+        store.append(turn['id'], parse_line('{"type":"result","result":"earlier answer"}'))
+        store.finish(turn['id'], 'completed')
+        second = store.journal(inbound(2, 'current request'))
+        turn, _ = store.claim(second['id'], 3)
+        store.append(turn['id'], session)  # No prompt metadata from the old code.
+        turn, recovering = store.claim(second['id'], 3)
+        assert recovering
+        assert store.prepare_prompt(turn, second['text']) == 'current request'
+        assert store.prepare_prompt(turn, second['text']) == 'current request'
+    finally:
+        store.close()
+
+
+def test_transcript_notice_does_not_evict_only_recent_turn(tmp_path):
+    store = Storage(tmp_path / 'boundary.db')
+    try:
+        for mid in (1, 2):
+            row = store.journal(inbound(mid, f'question {mid} ' + 'u' * 120))
+            turn, _ = store.claim(row['id'], 3)
+            store.append(turn['id'], parse_line(json.dumps({'type': 'result', 'result': f'answer {mid} ' + 'a' * 120})))
+            store.finish(turn['id'], 'completed')
+        # Newest full turn fits; adding the omission notice requires excerpts.
+        text, count, truncated = store.transcript(turn['task_id'], 3, limit=300)
+        assert len(text) <= 300 and count == 1 and truncated
+        assert 'User:\nquestion 2 ' in text and 'Assistant:\nanswer 2 ' in text
+        assert '[Text truncated]' in text and 'question 1' not in text
     finally:
         store.close()

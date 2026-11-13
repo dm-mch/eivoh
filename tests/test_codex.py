@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -45,12 +46,25 @@ def test_parser_failure_and_warnings():
     assert bad.events[0].kind == 'error'
 
 
-def test_effective_model(tmp_path, monkeypatch):
+def test_model_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv('CODEX_HOME', str(tmp_path))
-    assert CodexExecutor(tmp_path, 'codex', model='m').effective_model() == 'm'
-    assert CodexExecutor(tmp_path, 'codex').effective_model() is None
+    metadata = CodexExecutor(tmp_path, 'codex', model='m').model_metadata()
+    assert metadata['requested_model'] == 'm'
+    assert metadata['requested_model_source'] == 'executor_config'
+    assert metadata['observed_model'] is None
+    assert CodexExecutor(tmp_path, 'codex').model_metadata()['configured_model'] is None
     (tmp_path / 'config.toml').write_text('model = "gpt-test"\n')
-    assert CodexExecutor(tmp_path, 'codex').effective_model() == 'gpt-test (codex config)'
+    executor = CodexExecutor(tmp_path, 'codex')
+    metadata = executor.model_metadata()
+    assert metadata['configured_model'] == 'gpt-test'
+    assert metadata['configured_model_source'] == 'codex_config'
+    assert metadata['requested_model'] is metadata['observed_model'] is None
+    override = executor.model_metadata('turn-model')
+    assert override['requested_model'] == 'turn-model'
+    assert override['requested_model_source'] == 'turn'
+    assert override['configured_model'] is override['observed_model'] is None
+    (tmp_path / 'config.toml').write_bytes(b'\xff')
+    assert executor.model_metadata()['configured_model'] is None
 
 
 def test_command_and_environment(tmp_path, monkeypatch):
@@ -98,7 +112,7 @@ async def test_new_codex_task_runs_and_resumes(codex_rig):
     final = channel.edits[-1][2] if channel.edits else channel.sent[-1][1]
     assert 'echo: again resumed=True' in final and 'Working on it' not in final
     assert storage.stored_result(second['id']) == ('echo: again resumed=True', None)
-    meta = storage.db.execute("SELECT stream, payload FROM raw_event WHERE turn_id=? ORDER BY sequence LIMIT 1", (second['id'],)).fetchone()
+    meta = storage.db.execute("SELECT stream, payload FROM raw_event WHERE turn_id=? AND json_extract(payload, '$.executor') IS NOT NULL ORDER BY sequence LIMIT 1", (second['id'],)).fetchone()
     payload = json.loads(meta['payload'])
     assert meta['stream'] == 'meta' and payload['executor'] == 'CodexExecutor'
     assert payload['argv'][-2:] == [first['session_id'], '-'] and 'again' not in json.dumps(payload)
@@ -154,7 +168,7 @@ async def test_codex_turn_model_override_and_meta(codex_rig):
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     for records, call, model in zip([first, second], calls, ['gpt-6.1-sol', 'gpt-6-astra']):
         assert call['args'][call['args'].index('-m') + 1] == model
-        assert next(r.payload['model'] for r in records if r.stream == 'meta') == model
+        assert next(r.payload['requested_model'] for r in records if r.stream == 'meta') == model
     assert calls[1]['args'][-3:] == ['resume', sid, '-']
     assert codex.model == 'configured-default'
     assert 'configured-default' in codex.command(None)
@@ -229,6 +243,80 @@ async def test_model_handoff_survives_reopen_before_session(codex_rig, tmp_path,
         assert call['prompt'].endswith('Current request:\ncontinue after restart')
         assert reopened.turn_for(3)['status'] == 'completed'
         assert reopened.turn_for(3)['recovery_count'] == int(started)
+    finally:
+        await new.shutdown()
+        reopened.close()
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+async def test_handoff_survives_repeated_restart_after_session_started(codex_rig, tmp_path, legacy):
+    from eivoh.executors.base import Event, Record
+    from eivoh.gateway import RESTART_PROMPT
+    from eivoh.storage import Storage
+    gateway, storage, codex, channel, log = codex_rig
+    model_cache(tmp_path / 'models_cache.json')
+    await gateway.receive(inbound(1, 'remember violet'))
+    await gateway.receive(inbound(2, '/model astra'))
+    await gateway.idle()
+    row = storage.journal(inbound(3, 'what word?'))
+    session = Record(None, None, (Event('session_started', {}, None, 'handoff-session'),))
+    if legacy:
+        turn, _ = storage.claim(row['id'], 3)
+        storage.append(turn['id'], session)  # Old code persisted only the new ID.
+    await gateway.shutdown()
+    calls = []
+
+    class InterruptedExecutor:
+        def __init__(self, store):
+            self.store, self.stopped = store, asyncio.Event()
+
+        async def start(self, run_id, prompt, model=None):
+            # The assembled input must be durable before the executor is called.
+            journal = self.store.db.execute(
+                "SELECT payload FROM raw_event WHERE turn_id=? AND stream='meta' ORDER BY sequence", (run_id,)).fetchall()
+            assert any(json.loads(r[0]).get('type') == 'turn_prompt' for r in journal)
+            calls.append(prompt)
+            yield session  # Crash window: session exists, prompt not accepted.
+            await self.stopped.wait()
+
+        def resume(self, run_id, session_id, prompt, model=None):
+            assert session_id == 'handoff-session'
+            return self.start(run_id, prompt, model)
+
+        async def cancel(self, run_id):
+            self.stopped.set()
+
+        async def shutdown(self):
+            self.stopped.set()
+
+    # Three starts total before final recovery: all must keep the same handoff.
+    for attempt in range(2 if legacy else 3):
+        reopened = Storage(tmp_path / 'state.db')
+        interrupted = InterruptedExecutor(reopened)
+        new = Gateway(reopened, gateway.executor, {'fake': channel},
+                      executors={'codex': interrupted}, edit_interval=0)
+        try:
+            await new.start()
+            await until(lambda: len(calls) == attempt + 1)
+            assert reopened.turn_for(3)['session_id'] == 'handoff-session'
+        finally:
+            await new.shutdown()
+            reopened.close()
+    reopened = Storage(tmp_path / 'state.db')
+    new = Gateway(reopened, gateway.executor, {'fake': channel}, executors={'codex': codex}, edit_interval=0)
+    try:
+        await new.start()
+        await new.idle()
+        calls.append(json.loads(log.read_text())['prompt'])
+        for prompt in calls:
+            assert 'User:\nremember violet' in prompt
+            assert 'Assistant:\nWorking done: remember violet' in prompt
+            assert prompt.endswith('Current request:\nwhat word?')
+            assert prompt.count(RESTART_PROMPT) <= 1
+        assert reopened.turn_for(3)['status'] == 'completed'
+        assert reopened.turn_for(3)['recovery_count'] == 3
+        assert reopened.db.execute("SELECT COUNT(*) FROM raw_event WHERE turn_id=? AND json_extract(payload, '$.type')='turn_prompt'",
+                                   (reopened.turn_for(3)['id'],)).fetchone()[0] == 1
     finally:
         await new.shutdown()
         reopened.close()

@@ -216,7 +216,7 @@ class Gateway:
                     _, count, truncated = self.storage.transcript(task["id"], row["id"])
                     reply = f"Switched to {name} / {model}; context will be passed as a transcript of {count} earlier turns."
                     if truncated:
-                        reply += " Transcript truncated: oldest turns omitted."
+                        reply += " Transcript truncated: older turns or parts of the newest turn omitted."
                 elif task["session_id"]:
                     reply = f"Model: {name} / {model}. Context kept (same session)."
                 else:
@@ -237,12 +237,10 @@ class Gateway:
         text, tool, error = "", "", None
         completed = False
         current_deltas = False
-        prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{row['text']}" if recovering and turn["resume_id"] else row["text"]
-        if not turn["resume_id"]:
-            transcript, _, _ = self.storage.transcript(turn["task_id"], row["id"])
-            if transcript:
-                prompt = f"Earlier conversation in this task (transcript from Eivoh):\n\n{transcript}End of transcript.\n\nCurrent request:\n{prompt}"
         try:
+            prompt = self.storage.prepare_prompt(turn, row['text'])
+            if recovering and turn['resume_id']:
+                prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{prompt}"
             if recovering:
                 await safe_call(channel.send, chat, f"Service restarted; recovering task {turn['task_id']} (attempt {turn['recovery_count']}/{self.max_recoveries}).")
             executor = self.executors.get(turn["executor"])
