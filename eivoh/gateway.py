@@ -268,7 +268,7 @@ class Gateway:
             marker = '▶' if current and current['id'] == task['id'] else '·'
             state = 'closed' if task['status'] == 'closed' else self._state(task)
             lines.append(f"\n{marker} {task['id']} · {literal(task_title(task))}\n    {task['executor']}/{task['model'] or 'default'}"
-                         f" · {state} · {relative_time(task['last_active'])}")
+                         f" · {state} · {relative_time(task['last_active'])}{lifetime(task)}")
             buttons.append([(f"{task['id']} · {task_title(task)}", f"/task {task['id']}")])
         if not shown:
             lines.append('No tasks. Use /new or send a message.')
@@ -505,13 +505,24 @@ def task_title(task):
     return snippet(task['title'] or 'Untitled', 40)
 
 
-def relative_time(value):
-    stamp = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
-    seconds = max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
-    if seconds < 60:
-        return 'just now'
+def _stamp(value):
+    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+
+
+def compact(seconds):
     if seconds < 3600:
-        return f'{seconds // 60}m ago'
+        return f'{seconds // 60}m'
     if seconds < 86400:
-        return f'{seconds // 3600}h ago'
-    return f'{seconds // 86400}d ago'
+        return f'{seconds // 3600}h'
+    return f'{seconds // 86400}d'
+
+
+def lifetime(task):
+    """How long the task has been worked on: from creation to its last activity."""
+    seconds = int((_stamp(task['last_active']) - _stamp(task['created_at'])).total_seconds())
+    return f' · over {compact(seconds)}' if seconds >= 60 else ''
+
+
+def relative_time(value):
+    seconds = max(0, int((datetime.now(timezone.utc) - _stamp(value)).total_seconds()))
+    return 'just now' if seconds < 60 else compact(seconds) + ' ago'

@@ -139,7 +139,8 @@ Chat commands:
   task stays open and keeps running. An unrecognized first word is part of the title.
 * `/tasks [page]` lists open tasks, most recently active first, eight per page.
   Each entry shows its number, title, executor/model, running/queued/idle state
-  and time since activity. Buttons switch tasks or change pages; the list reports
+  time since activity and, compactly, how long the task has been worked on
+  (creation to last activity, for example `over 3h`). Buttons switch tasks or change pages; the list reports
   how many other open tasks exist. `/tasks all [page]` includes closed tasks.
 * `/task N` switches to task N, reopening it if closed, and shows short excerpts
   of its last user message and stored answer. `/task` lists tasks.
