@@ -81,7 +81,7 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
 def test_schema_version_reopen_and_future_rejected(tmp_path):
     path = tmp_path / 'version.db'
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 6
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
     store.journal(inbound(1, 'retained'))
     store.close()
     store = Storage(path)
@@ -113,6 +113,33 @@ def test_v5_migration_preserves_interrupted_telegram_part_ids(tmp_path):
     assert storage.task(1, 1)['title'] == 'Keep name'
     assert not storage.db.execute('PRAGMA foreign_key_check').fetchall()
     storage.close()
+
+
+def test_v6_migration_adds_message_indexes_without_changing_journal(tmp_path, monkeypatch):
+    import eivoh.storage as module
+    path = tmp_path / 'v6.db'
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'MIGRATIONS', module.MIGRATIONS[:6])
+        store = Storage(path)
+        store.journal(inbound(1, 'retained'))
+        row = store.prepare_delivery('telegram', '10', 'turn:1', '0', {'kind': 'text', 'text': 'Working'}, 1, 1)
+        attempt = store.begin_delivery(row['id'], 'send', json.loads(row['payload']))
+        store.delivery_outcome(row['id'], attempt, 'sent', '10')
+        tables = [row[0] for row in store.db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        before = {table: [tuple(row) for row in store.db.execute(f'SELECT * FROM {table} ORDER BY rowid')] for table in tables}
+        store.close()
+    store = Storage(path)
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
+    for table in tables:
+        assert [tuple(row) for row in store.db.execute(f'SELECT * FROM {table} ORDER BY rowid')] == before[table]
+    for table in ('inbound', 'delivery'):
+        indexes = {row['name'] for row in store.db.execute(f'PRAGMA index_list({table})')}
+        assert f'{table}_message_number' in indexes
+    assert not store.db.execute('PRAGMA foreign_key_check').fetchall()
+    store.close()
+    store = Storage(path)
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
+    store.close()
 
 
 def test_ordered_migrations_rollback_together(tmp_path, monkeypatch):
@@ -164,7 +191,7 @@ def test_v1_upgrades_in_place(tmp_path):
                    "VALUES (1,1,1,1,'running','old-session')")
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 6
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 7
         task = store.active_task(1)
         assert task['model'] is None and task['session_id'] == 'old-session'
         turn, recovering = store.claim(1, 3)
