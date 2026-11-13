@@ -112,6 +112,7 @@ class Gateway:
         self.active_runs = {}
         self.steer_jobs = {}
         self.notice_jobs = {}
+        self.reaction_jobs = {}
         self.media_jobs = {}
         self.media_slots = asyncio.Semaphore(2)
         self.output_jobs = {}
@@ -165,16 +166,23 @@ class Gateway:
             if turn is None:
                 await self._command(row)
             else:
+                worker = self.workers.get(turn['task_id'])
+                busy = worker is not None and not worker.done()
+                busy = busy or any(item['id'] < row['id'] for item in self.storage.pending_task(turn['task_id']))
                 if row['preparation'] == 'pending':
                     self._prepare_media(row)
                 self._kick(turn['task_id'])
                 reserved = self._kick_steer(turn['task_id'])
                 if turn['force_queue']:
-                    self._notice(row, f"Queued for task {turn['task_id']} after earlier messages.", turn['task_id'], 'admission')
-                elif turn['task_id'] in self.active_runs and row['id'] not in reserved:
-                    notice = (f"Preparing attachment for task {turn['task_id']}." if row['preparation'] == 'pending' else
-                              f"Queued for task {turn['task_id']} after earlier messages, using the selected model.")
-                    self._notice(row, notice, turn['task_id'], 'admission')
+                    if busy:
+                        self._react(row, '✍', turn['task_id'])
+                elif busy and row['id'] not in reserved:
+                    active = self.active_runs.get(turn['task_id'])
+                    task = self.storage.task(row['conversation_id'], turn['task_id'])
+                    if active and row['preparation'] != 'pending' and (active[0]['executor'], active[0]['model']) != (task['executor'], task['model']):
+                        self._notice(row, f"Queued for task {turn['task_id']} after earlier messages, using the selected model.", turn['task_id'], 'admission')
+                    else:
+                        self._react(row, '✍', turn['task_id'])
             for reply in self.replies:
                 reply.changed.set()  # A second task or switch may change labels.
         return True
@@ -263,19 +271,43 @@ class Gateway:
         if self.storage.inbound(row['id'])['state'] == 'cancelled' or self.closing:
             return
         if delivery['state'] == 'accepted':
-            self._notice(row, f"Added to the running task {task_id}.", task_id, 'steering')
+            self._react(row, '👀', task_id)
         else:
-            text = (f"Delivery to task {task_id} could not be confirmed. Kept for the next turn; it will check for work already done."
-                    if delivery['state'] == 'unknown' else f"Queued for task {task_id}; the running turn is ending.")
-            self._notice(row, text, task_id, 'steering')
+            if delivery['state'] == 'unknown':
+                self._notice(row, f"Delivery to task {task_id} could not be confirmed. Kept for the next turn; it will check for work already done.", task_id, 'steering')
+            else:
+                self._react(row, '✍', task_id)
             self._kick(task_id)  # An exceptional parent may have ended while this input was sending.
+
+    def _react(self, row, emoji, task_id):
+        channel = self.channels[row['channel']]
+        if row['message_id'].startswith('cb:') or not hasattr(channel, 'react') or self.closing:
+            return
+        previous = self.reaction_jobs.get(row['id'])
+        async def react():
+            try:
+                if previous:
+                    await asyncio.gather(previous, return_exceptions=True)
+                if not self.closing and self.storage.inbound(row['id'])['state'] != 'cancelled':
+                    await channel.react(row['chat_id'], row['message_id'], emoji)
+            except Exception as exc:
+                log.debug('Reaction not sent: %s', type(exc).__name__)
+        job = asyncio.create_task(react())
+        self.reaction_jobs[row['id']] = job
+        self._track_notice(job, task_id)
+        def forget(done):
+            if self.reaction_jobs.get(row['id']) is done:
+                self.reaction_jobs.pop(row['id'], None)
+        job.add_done_callback(forget)
 
     def _notice(self, row, text, task_id, purpose='notice'):
         # Chat flood control must not hold transport completion or executor slots.
         if hasattr(self.channels[row['channel']], 'prepare_reply'):
             self._queue_send(row, text, task_id, purpose=purpose)
             return
-        job = asyncio.create_task(self._send(row, text, task_id))
+        self._track_notice(asyncio.create_task(self._send(row, text, task_id)), task_id)
+
+    def _track_notice(self, job, task_id):
         self.notice_jobs.setdefault(task_id, set()).add(job)
         def forget(done):
             jobs = self.notice_jobs.get(task_id)

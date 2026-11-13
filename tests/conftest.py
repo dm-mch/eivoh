@@ -16,6 +16,7 @@ class FakeChannel:
         self.edits = []
         self.typings = []
         self.buttons = []
+        self.reactions = []
 
     async def send(self, chat_id, text, buttons=None):
         self.sent.append((chat_id, text))
@@ -27,6 +28,9 @@ class FakeChannel:
 
     async def typing(self, chat_id):
         self.typings.append(chat_id)
+
+    async def react(self, chat_id, message_id, emoji):
+        self.reactions.append((chat_id, message_id, emoji))
 
 
 def inbound(mid, text, chat="10", reply_to=None):

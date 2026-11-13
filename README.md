@@ -327,7 +327,11 @@ executor/model still matches the task's selection. The chat confirms only after
 the executor acknowledges the input before the reader sees the turn end; this
 confirms receipt, not completion of its instructions. A late acknowledgement stays
 uncertain and cannot attach the input to an already finished answer.
-Claude may acknowledge only after its current tool finishes.
+Claude may acknowledge only after its current tool finishes. Acceptance is shown
+by a 👀 reaction on the owner's message; ordinary queueing uses ✍. Text notices
+remain for unconfirmed delivery and queueing due to a changed executor/model.
+Channels without reactions stay silent; reactions are best effort and are not
+replayed after a restart. This reaction behaviour is unverified in live Telegram.
 `/q <text>` keeps a message for the next turn. Later messages cannot jump an
 earlier queued input, and messages after a model change use the next turn.
 Messages arriving as a run ends safely stay queued. Commands themselves never
@@ -338,7 +342,8 @@ bounded globally by `EIVOH_MAX_PARALLEL` (default 3, integer at least 1); turns
 waiting for a slot stay queued. Commands run immediately in arrival order under
 the conversation lock and never wait behind executor work. `/q` journals its
 text as a queued turn; other commands create no turns. Steering acknowledgements
-and their notices run separately from polling and executor-slot accounting.
+and their reactions or exceptional notices run separately from polling and
+executor-slot accounting.
 Cancellation is committed before terminating the target task's process tree.
 Cancelled messages remain in the journal.
 
