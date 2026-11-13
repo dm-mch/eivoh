@@ -1,5 +1,6 @@
 """Single-event-loop SQLite state. Transactions contain no awaits."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import sqlite3
@@ -102,12 +103,40 @@ MIGRATIONS = (
             detail TEXT NOT NULL DEFAULT '')""",
         "CREATE INDEX steering_parent ON steering(parent_turn_id,state)",
     ),
+    (
+        "ALTER TABLE inbound ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE inbound ADD COLUMN preparation TEXT NOT NULL DEFAULT 'ready'",
+        "ALTER TABLE inbound ADD COLUMN prepared_text TEXT",
+        "CREATE TABLE update_receipt (channel TEXT NOT NULL, update_id INTEGER NOT NULL, received_at TEXT NOT NULL, PRIMARY KEY(channel,update_id))",
+        "CREATE TABLE poll_cursor (channel TEXT PRIMARY KEY, next_id INTEGER NOT NULL, updated_at TEXT NOT NULL)",
+        "CREATE TABLE turn_output (turn_id INTEGER PRIMARY KEY REFERENCES turn, text TEXT NOT NULL, artifacts TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, cancelled INTEGER NOT NULL DEFAULT 0)",
+        """CREATE TABLE delivery (
+            id INTEGER PRIMARY KEY, channel TEXT NOT NULL, chat_id TEXT NOT NULL,
+            logical_id TEXT NOT NULL, part TEXT NOT NULL, task_id INTEGER REFERENCES task, turn_id INTEGER REFERENCES turn,
+            payload TEXT NOT NULL, message_id TEXT, state TEXT NOT NULL DEFAULT 'pending', detail TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 1, cancelled INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(channel,chat_id,logical_id,part))""",
+        """CREATE TABLE delivery_attempt (
+            id INTEGER PRIMARY KEY, delivery_id INTEGER NOT NULL REFERENCES delivery,
+            operation TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'sending',
+            message_id TEXT, detail TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""",
+        # V5 already retained the physical ids of interrupted answers for reply
+        # routing. Reuse these ids when their answer resumes after migration.
+        """INSERT INTO delivery(channel,chat_id,logical_id,part,task_id,turn_id,payload,message_id,state)
+            SELECT outbound.channel,outbound.chat_id,'turn:' || turn_id,
+                CAST(ROW_NUMBER() OVER (PARTITION BY turn_id ORDER BY CAST(message_id AS INTEGER))-1 AS TEXT),
+                outbound.task_id,turn_id,'{"kind":"text","text":""}',message_id,'sent'
+            FROM outbound JOIN turn ON turn.id=outbound.turn_id
+            WHERE outbound.channel='telegram' AND message_id!='' AND message_id NOT GLOB '*[^0-9]*'
+                AND turn.status IN ('queued','running')""",
+    ),
 )
 
 
 class Storage:
     def __init__(self, path: Path, default_executor="claude"):
         self.default_executor = default_executor
+        self.state_dir = path.parent.resolve()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
@@ -141,27 +170,54 @@ class Storage:
 
     def journal(self, message: Inbound):
         with self.db:
+            if message.update_id is not None:
+                self.receipt(message.channel, message.update_id)
             self.db.execute("INSERT OR IGNORE INTO conversation(channel,chat_id) VALUES (?,?)", (message.channel, message.chat_id))
             conv = self.db.execute("SELECT id FROM conversation WHERE channel=? AND chat_id=?", (message.channel, message.chat_id)).fetchone()[0]
-            cur = self.db.execute("INSERT OR IGNORE INTO inbound(conversation_id,channel,chat_id,user_id,message_id,text,reply_to) VALUES (?,?,?,?,?,?,?)",
-                                  (conv, message.channel, message.chat_id, message.user_id, message.message_id, message.text, message.reply_to))
+            cur = self.db.execute("INSERT OR IGNORE INTO inbound(conversation_id,channel,chat_id,user_id,message_id,text,reply_to,attachments,preparation) VALUES (?,?,?,?,?,?,?,?,?)",
+                                  (conv, message.channel, message.chat_id, message.user_id, message.message_id, message.text, message.reply_to,
+                                   json.dumps(message.attachments), 'pending' if message.attachments else 'ready'))
             if not cur.rowcount:
                 return None
             inbound_id = cur.lastrowid
             # Unknown slash text (a path, an executor's own command) is an ordinary
             # message. A button press is always a command; the gateway rejects unknown ones.
-            if not (message.button or command(message.text) in COMMANDS) or (command(message.text) == '/q' and len(message.text.split(maxsplit=1)) == 2):
+            if message.attachments or not (message.button or command(message.text) in COMMANDS) or (command(message.text) == '/q' and len(message.text.split(maxsplit=1)) == 2):
                 target = self.reply_task(conv, message.reply_to) or self.active_task(conv)
                 task_id = target['id'] if target else self._create_task(conv)
-                title = default_title(message.text)
+                title = default_title(message.text or 'Attached file')
                 self.db.execute("UPDATE task SET status='active',title=COALESCE(title,?),last_active=? WHERE id=?",
                                 (title, now(), task_id))
                 self.db.execute("INSERT INTO turn(inbound_id,conversation_id,task_id,force_queue) VALUES (?,?,?,?)",
-                                (inbound_id, conv, task_id, command(message.text) == '/q'))
+                                (inbound_id, conv, task_id, not message.attachments and command(message.text) == '/q'))
         return self.inbound(inbound_id)
 
     def inbound(self, inbound_id):
         return self.db.execute("SELECT * FROM inbound WHERE id=?", (inbound_id,)).fetchone()
+
+    def receipt(self, channel, update_id):
+        # Caller owns the transaction; never acknowledge an uncommitted admission.
+        self.db.execute("INSERT OR REPLACE INTO update_receipt VALUES (?,?,?)", (channel, update_id, now()))
+
+    def saw_update(self, channel, update_id):
+        # Telegram may choose fresh random ids after a week without updates.
+        return self.db.execute("SELECT 1 FROM update_receipt WHERE channel=? AND update_id=? AND received_at>?",
+            (channel, update_id, (datetime.now(timezone.utc) - timedelta(days=6)).isoformat(sep=' '))).fetchone() is not None
+
+    def advance_cursor(self, channel, next_id):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO poll_cursor VALUES (?,?,?)", (channel, next_id, now()))
+
+    def cursor(self, channel):
+        row = self.db.execute("SELECT * FROM poll_cursor WHERE channel=?", (channel,)).fetchone()
+        if row and (datetime.now(timezone.utc) - datetime.fromisoformat(row['updated_at'])).total_seconds() < 6 * 86400:
+            return row['next_id']
+        return None
+
+    def prepared(self, inbound_id, text, attachments, failed=False):
+        with self.db:
+            return self.db.execute("UPDATE inbound SET prepared_text=?,attachments=?,preparation=? WHERE id=? AND state='queued'",
+                (text, json.dumps(attachments), 'failed' if failed else 'ready', inbound_id)).rowcount != 0
 
     def pending(self, conversation_id=None):
         sql = "SELECT * FROM inbound WHERE state IN ('queued','running')"
@@ -190,6 +246,7 @@ class Storage:
             child = self.turn_for(inbound_id)
             task = self.task(parent['conversation_id'], parent['task_id'])
             if (parent['status'] != 'running' or child['status'] != 'queued' or child['force_queue'] or
+                    self.inbound(inbound_id)['preparation'] != 'ready' or
                     self.steering(inbound_id) or parent['executor'] != task['executor'] or parent['model'] != task['model']):
                 return None
             earlier = self.db.execute("SELECT 1 FROM turn WHERE task_id=? AND inbound_id<? AND id!=? "
@@ -221,7 +278,8 @@ class Storage:
     def input_text(self, inbound_id):
         row = self.inbound(inbound_id)
         turn = self.turn_for(inbound_id)
-        text = row['text'].split(maxsplit=1)[1] if turn['force_queue'] else row['text']
+        source = row['prepared_text'] if row['prepared_text'] is not None else row['text']
+        text = source.split(maxsplit=1)[1] if turn['force_queue'] else source
         delivery = self.steering(inbound_id)
         if delivery and delivery['state'] == 'unknown':
             text = ("Eivoh could not confirm delivery of this clarification during the previous run. "
@@ -230,7 +288,7 @@ class Storage:
         return text
 
     def accepted_inputs(self, turn_id):
-        return self.db.execute("SELECT inbound.id,inbound.text FROM inbound JOIN steering ON steering.inbound_id=inbound.id "
+        return self.db.execute("SELECT inbound.id,COALESCE(inbound.prepared_text,inbound.text) AS text FROM inbound JOIN steering ON steering.inbound_id=inbound.id "
                                "WHERE parent_turn_id=? AND steering.state='accepted' ORDER BY inbound.id", (turn_id,)).fetchall()
 
     def recovery_inputs(self, turn_id):
@@ -390,7 +448,8 @@ class Storage:
         for turn in turns:
             result = self.stored_result(turn['id'])
             if result is not None:
-                return turns[0]['text'], result[0]
+                output = self.output(turn['id'])
+                return turns[0]['text'], output['text'] if output is not None else result[0]
         return (turns[0]['text'] if turns else None), None
 
     def remember_outbound(self, channel, chat_id, message_ids, task_id, turn_id=None):
@@ -398,6 +457,83 @@ class Storage:
         with self.db:
             self.db.executemany("INSERT OR REPLACE INTO outbound VALUES (?,?,?,?,?)",
                                 [(channel, chat_id, mid, task_id, turn_id) for mid in message_ids])
+
+    def output(self, turn_id):
+        return self.db.execute("SELECT * FROM turn_output WHERE turn_id=?", (turn_id,)).fetchone()
+
+    def save_output(self, turn_id, text, artifacts):
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO turn_output(turn_id,text,artifacts) VALUES (?,?,?)",
+                            (turn_id, text, json.dumps(artifacts)))
+        return self.output(turn_id)
+
+    def output_delivered(self, turn_id):
+        with self.db:
+            self.db.execute("UPDATE turn_output SET delivered=1 WHERE turn_id=?", (turn_id,))
+
+    def pending_outputs(self):
+        return self.db.execute("SELECT inbound.*,turn.id AS output_turn,turn.task_id FROM turn_output JOIN turn ON turn.id=turn_id "
+            "JOIN inbound ON inbound.id=turn.inbound_id WHERE delivered=0 AND turn_output.cancelled=0 AND turn.status IN ('completed','failed') ORDER BY turn_id").fetchall()
+
+    def prepare_delivery(self, channel, chat, logical, part, payload, task_id=None, turn_id=None, *, commit=True):
+        encoded = json.dumps(payload, sort_keys=True)
+        with self.db if commit else nullcontext():
+            self.db.execute("INSERT OR IGNORE INTO delivery(channel,chat_id,logical_id,part,payload,task_id,turn_id) VALUES (?,?,?,?,?,?,?)",
+                            (channel, chat, logical, part, encoded, task_id, turn_id))
+            row = self.db.execute("SELECT * FROM delivery WHERE channel=? AND chat_id=? AND logical_id=? AND part=?",
+                                  (channel, chat, logical, part)).fetchone()
+            if row['payload'] != encoded:
+                # A lost initial send never becomes a new send just because the
+                # streamed text changed. A known id can be safely edited instead.
+                state = row['state'] if row['state'] == 'sending' or row['state'] == 'unknown' and not row['message_id'] else 'pending'
+                deleted = json.loads(row['payload']).get('kind') == 'delete' and row['state'] == 'sent'
+                self.db.execute("UPDATE delivery SET payload=?,state=?,detail='',revision=revision+1,message_id=CASE WHEN ? THEN NULL ELSE message_id END WHERE id=?",
+                                (encoded, state, deleted, row['id']))
+        return self.delivery(row['id'])
+
+    def delivery(self, delivery_id):
+        return self.db.execute("SELECT * FROM delivery WHERE id=?", (delivery_id,)).fetchone()
+
+    def delivery_parts(self, channel, chat, logical):
+        return self.db.execute("SELECT * FROM delivery WHERE channel=? AND chat_id=? AND logical_id=? ORDER BY id",
+                               (channel, chat, logical)).fetchall()
+
+    def begin_delivery(self, delivery_id, operation, payload, revision=None):
+        with self.db:
+            revision = self.delivery(delivery_id)['revision'] if revision is None else revision
+            attempt = self.db.execute("INSERT INTO delivery_attempt(delivery_id,operation,payload,revision) VALUES (?,?,?,?)",
+                                      (delivery_id, operation, json.dumps(payload, sort_keys=True), revision)).lastrowid
+            # The attempted revision can be older than the current desired
+            # payload (e.g. a flood wait). The actual write is still in flight.
+            self.db.execute("UPDATE delivery SET state='sending' WHERE id=?", (delivery_id,))
+        return attempt
+
+    def delivery_outcome(self, delivery_id, attempt, state, message_id=None, detail=''):
+        with self.db:
+            self.db.execute("UPDATE delivery_attempt SET state=?,message_id=?,detail=? WHERE id=?",
+                            (state, message_id, detail, attempt))
+            current = self.delivery(delivery_id)
+            attempted = self.db.execute("SELECT revision,operation FROM delivery_attempt WHERE id=?", (attempt,)).fetchone()
+            deleted = attempted['operation'] == 'delete' and state == 'sent'
+            if current['revision'] != attempted['revision'] and state != 'unknown':
+                state = 'pending'  # Ack of progress cannot acknowledge a newer final answer.
+            self.db.execute("UPDATE delivery SET state=?,message_id=COALESCE(?,message_id),detail=? WHERE id=?",
+                            (state, message_id, detail, delivery_id))
+            if deleted:
+                self.db.execute("UPDATE delivery SET message_id=NULL WHERE id=?", (delivery_id,))
+            row = self.delivery(delivery_id)
+            if message_id is not None and row['task_id'] is not None:
+                self.db.execute("INSERT OR REPLACE INTO outbound VALUES (?,?,?,?,?)",
+                                (row['channel'], row['chat_id'], message_id, row['task_id'], row['turn_id']))
+
+    def recover_deliveries(self):
+        with self.db:
+            self.db.execute("UPDATE delivery SET state='unknown',detail='Interrupted send without acknowledgement' "
+                            "WHERE message_id IS NULL AND EXISTS (SELECT 1 FROM delivery_attempt WHERE delivery_id=delivery.id "
+                            "AND operation='send' AND state IN ('sending','unknown'))")
+            self.db.execute("UPDATE delivery_attempt SET state='unknown',detail='Interrupted before acknowledgement' WHERE state='sending'")
+            self.db.execute("UPDATE delivery SET state=CASE WHEN message_id IS NULL THEN 'unknown' ELSE 'pending' END,"
+                            "detail='Interrupted before acknowledgement' WHERE state='sending'")
 
     def switch_task(self, inbound_id, task_id):
         with self.db:
@@ -486,7 +622,7 @@ class Storage:
         """Recent whole turns, or excerpts of the newest oversized turn."""
         limit = max(0, limit)
         blocks, size, truncated, newest = [], 0, False, None
-        rows = self.db.execute("SELECT turn.id,turn.inbound_id,inbound.text FROM turn JOIN inbound ON inbound.id=turn.inbound_id "
+        rows = self.db.execute("SELECT turn.id,turn.inbound_id,COALESCE(inbound.prepared_text,inbound.text) AS text FROM turn JOIN inbound ON inbound.id=turn.inbound_id "
                                "WHERE turn.task_id=? AND turn.inbound_id<? AND (turn.inbound_id>? OR EXISTS "
                                "(SELECT 1 FROM steering WHERE parent_turn_id=turn.id AND state='accepted' AND inbound_id>?)) "
                                "AND NOT EXISTS (SELECT 1 FROM steering WHERE inbound_id=turn.inbound_id AND state='accepted') AND (turn.status IN ('completed','failed') "
@@ -496,6 +632,13 @@ class Storage:
         for row in rows:
             result = self.stored_result(row["id"])
             answer = result[0] if result is not None else "[No stored final answer.]"
+            if output := self.output(row['id']):
+                answer = output['text']
+                artifacts = json.loads(output['artifacts'])
+                if artifacts:
+                    answer += ('\n\nGenerated files retained by Eivoh (not a delivery acknowledgement). '
+                               'Read these snapshots as prior input; write revisions in the current turn output directory:\n' +
+                               json.dumps([{key: artifact[key] for key in ('name', 'path', 'kind')} for artifact in artifacts], ensure_ascii=False))
             inputs = ([row['text']] if row['inbound_id'] > after_inbound_id else [])
             inputs += [item['text'] for item in self.accepted_inputs(row['id']) if item['id'] > after_inbound_id]
             user = '\n\nUser (during the same turn):\n'.join(inputs)
@@ -586,6 +729,13 @@ class Storage:
         """Cancel before killing; only earlier turns in the requested scope."""
         with self.db:
             row = self.inbound(inbound_id)
+            # Cancellation also covers completed work awaiting network delivery.
+            output_scope = "SELECT id FROM turn WHERE conversation_id=? AND inbound_id<?" + (" AND task_id=?" if task_id is not None else '')
+            output_args = (row['conversation_id'], inbound_id) + ((task_id,) if task_id is not None else ())
+            self.db.execute(f"UPDATE turn_output SET cancelled=1 WHERE turn_id IN ({output_scope}) AND delivered=0", output_args)
+            self.db.execute("UPDATE delivery SET cancelled=1 WHERE channel=? AND chat_id=? AND state!='sent'" +
+                            (" AND task_id=?" if task_id is not None else ''),
+                            (row['channel'], row['chat_id']) + ((task_id,) if task_id is not None else ()))
             turns = self.db.execute("SELECT * FROM turn WHERE conversation_id=? AND inbound_id<? "
                                     "AND status IN ('queued','running')" + (" AND task_id=?" if task_id is not None else ""),
                                     (row['conversation_id'], inbound_id) + ((task_id,) if task_id is not None else ())).fetchall()

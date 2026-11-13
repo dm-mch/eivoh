@@ -3,12 +3,14 @@ import asyncio
 from contextlib import aclosing, suppress
 from datetime import datetime, timezone
 import logging
+import json
 
 from .channels.base import Channel, Inbound
 from .executors.base import Executor
 from .models import catalog, resolve
 from .storage import Storage, command
 from . import titles
+from .attachments import AttachmentError, output_instructions, snapshot_outputs, visible_text
 
 log = logging.getLogger(__name__)
 RESTART_PROMPT = "The service restarted; continue the interrupted task. Check existing work before repeating actions."
@@ -24,9 +26,11 @@ async def safe_call(method, *args):
 
 class Reply:
     """Coalesce display updates without blocking raw event persistence."""
-    def __init__(self, channel, chat_id, interval, prefix=lambda: "", sent_callback=lambda mid: None):
+    def __init__(self, channel, chat_id, interval, prefix=lambda: "", sent_callback=lambda mid: None,
+                 logical_id=None, task_id=None, turn_id=None):
         self.channel, self.chat_id, self.interval = channel, chat_id, interval
         self.prefix, self.sent_callback = prefix, sent_callback
+        self.logical_id, self.task_id, self.turn_id = logical_id, task_id, turn_id
         self.text = ""
         self.tool = ""
         self.sent = None
@@ -35,8 +39,8 @@ class Reply:
         self.closed = False
         self.job = asyncio.create_task(self.run())
 
-    def update(self, text, tool=""):
-        self.text, self.tool = text, tool
+    def update(self, text, tool="", *, final=False):
+        self.text, self.tool = visible_text(text, final=final), tool
         self.changed.set()
 
     async def run(self):
@@ -49,7 +53,11 @@ class Reply:
             if text:
                 text = self.prefix() + text
             if text and text != self.sent:
-                if self.message_id is None:
+                if hasattr(self.channel, 'deliver') and self.logical_id is not None:
+                    self.message_id = await safe_call(self.channel.deliver, self.chat_id, text,
+                                                     self.logical_id, self.task_id, self.turn_id)
+                    self.sent_callback(self.message_id)
+                elif self.message_id is None:
                     self.message_id = await safe_call(self.channel.send, self.chat_id, text)
                     # Do not retry ambiguous send failures: Telegram may have posted it.
                     if self.message_id is None:
@@ -81,11 +89,14 @@ class Reply:
 class Gateway:
     def __init__(self, storage: Storage, executor: Executor, channels: dict[str, Channel],
                  edit_interval=1.5, typing_interval=4, max_recoveries=3, executors=None, max_parallel=3,
-                 title_executors=None, title_timeout=30):
+                 title_executors=None, title_timeout=30, delivery_retry_delays=(1, 2, 4, 8, 16), delivery_timeout=300):
         # `executor` is the default one; `executors` adds named alternatives.
         self.default_executor = storage.default_executor
         self.executors = {**(executors or {}), self.default_executor: executor}
         self.storage, self.channels = storage, channels
+        for channel in channels.values():
+            if hasattr(channel, 'bind'):
+                channel.bind(storage)
         self.edit_interval, self.typing_interval = edit_interval, typing_interval
         self.max_recoveries = max_recoveries
         if not isinstance(max_parallel, int) or max_parallel < 1:
@@ -94,55 +105,105 @@ class Gateway:
         # Optional injection keeps fake/embedding executors entirely offline.
         self.title_executors = title_executors or {}
         self.title_timeout = title_timeout
+        self.delivery_retry_delays, self.delivery_timeout = delivery_retry_delays, delivery_timeout
         self.title_jobs = {}
         self.replies = set()
         self.workers = {}
         self.active_runs = {}
         self.steer_jobs = {}
         self.notice_jobs = {}
+        self.media_jobs = {}
+        self.media_slots = asyncio.Semaphore(2)
+        self.output_jobs = {}
         self.locks = {}
         self.model_catalogs = {}  # Numbers refer to the last list shown in this process.
         self.closing = False
 
     async def start(self):
         self.storage.recover_steering()
+        self.storage.recover_deliveries()
         # Commands have no turn. Replay them in journal order before any launch.
         for row in self.storage.pending():
+            if row['preparation'] == 'pending':
+                self._prepare_media(row)
             if self.storage.turn_for(row['id']) is None:
                 await self._command(row)
         for row in self.storage.pending():
             delivery = self.storage.steering(row['id'])
             if delivery and delivery['state'] == 'unknown':
                 task_id = self.storage.turn_for(row['id'])['task_id']
-                self._notice(row, f"Earlier delivery to task {task_id} could not be confirmed. Kept for recovery with a check for work already done.", task_id)
+                self._notice(row, f"Earlier delivery to task {task_id} could not be confirmed. Kept for recovery with a check for work already done.", task_id, 'recovery')
             self._kick(self.storage.turn_for(row['id'])['task_id'])
+        for row in self.storage.pending_outputs():
+            self._schedule_output(row, row['task_id'], row['output_turn'])
+        # Command/voice/steering notices may have been waiting on flood control
+        # after their inbound was finished. Their persisted intent is independent.
+        for row in self.storage.db.execute("SELECT DISTINCT channel,chat_id,logical_id,task_id FROM delivery "
+                                           "WHERE turn_id IS NULL AND cancelled=0 AND state='pending'").fetchall():
+            channel = self.channels.get(row['channel'])
+            if not hasattr(channel, 'delivery'):
+                continue
+            job = asyncio.create_task(self._retry_notice(channel, row['chat_id'], row['logical_id']))
+            self.notice_jobs.setdefault(row['task_id'], set()).add(job)
+            job.add_done_callback(lambda done, task_id=row['task_id']: self.notice_jobs.get(task_id, set()).discard(done))
         for task in self.storage.title_candidates():
             self._name_task(task['id'])
 
     async def receive(self, message: Inbound):
         if self.closing:
-            return
+            return False
         # Include journaling under the lock: an arrival during /stop must bind
         # after earlier commands have taken effect, and never be rebound later.
         key = (message.channel, message.chat_id)
         async with self.locks.setdefault(key, asyncio.Lock()):
             if self.closing:
-                return
+                return False
             row = self.storage.journal(message)
             if row is None:
-                return
+                return True
             turn = self.storage.turn_for(row['id'])
             if turn is None:
                 await self._command(row)
             else:
+                if row['preparation'] == 'pending':
+                    self._prepare_media(row)
                 self._kick(turn['task_id'])
                 reserved = self._kick_steer(turn['task_id'])
                 if turn['force_queue']:
-                    self._notice(row, f"Queued for task {turn['task_id']} after earlier messages.", turn['task_id'])
+                    self._notice(row, f"Queued for task {turn['task_id']} after earlier messages.", turn['task_id'], 'admission')
                 elif turn['task_id'] in self.active_runs and row['id'] not in reserved:
-                    self._notice(row, f"Queued for task {turn['task_id']} after earlier messages, using the selected model.", turn['task_id'])
+                    notice = (f"Preparing attachment for task {turn['task_id']}." if row['preparation'] == 'pending' else
+                              f"Queued for task {turn['task_id']} after earlier messages, using the selected model.")
+                    self._notice(row, notice, turn['task_id'], 'admission')
             for reply in self.replies:
                 reply.changed.set()  # A second task or switch may change labels.
+        return True
+
+    def _prepare_media(self, row):
+        if row['id'] in self.media_jobs:
+            return
+        task_id = self.storage.turn_for(row['id'])['task_id']
+        async def prepare():
+            try:
+                async with self.media_slots:
+                    async with asyncio.timeout(180):
+                        text, items = await self.channels[row['channel']].prepare(row)
+                if self.storage.prepared(row['id'], text, items):
+                    if text.startswith('[Voice message, speech-to-text]\n'):
+                        transcript = text.split('\n', 1)[1]
+                        self._notice(row, '🎤 ' + transcript[:4000], task_id, 'voice')
+                    self._kick_steer(task_id)
+                    self._kick(task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                reason = str(exc) if isinstance(exc, AttachmentError) else type(exc).__name__
+                text = 'Could not prepare the attachment: ' + reason
+                if self.storage.prepared(row['id'], text, json.loads(row['attachments']), failed=True):
+                    self._kick(task_id)
+        job = asyncio.create_task(prepare())
+        self.media_jobs[row['id']] = job
+        job.add_done_callback(lambda done: self.media_jobs.pop(row['id'], None))
 
     @property
     def executor(self):
@@ -187,7 +248,7 @@ class Gateway:
 
     async def _deliver_steering(self, task_id, parent, executor, row, input_id):
         try:
-            result = await executor.steer(parent['id'], input_id, row['text'])
+            result = await executor.steer(parent['id'], input_id, self.storage.input_text(row['id']))
         except asyncio.CancelledError:
             self.storage.steer_outcome(row['id'], 'unknown', 'Delivery interrupted')
             raise
@@ -202,15 +263,18 @@ class Gateway:
         if self.storage.inbound(row['id'])['state'] == 'cancelled' or self.closing:
             return
         if delivery['state'] == 'accepted':
-            self._notice(row, f"Added to the running task {task_id}.", task_id)
+            self._notice(row, f"Added to the running task {task_id}.", task_id, 'steering')
         else:
             text = (f"Delivery to task {task_id} could not be confirmed. Kept for the next turn; it will check for work already done."
                     if delivery['state'] == 'unknown' else f"Queued for task {task_id}; the running turn is ending.")
-            self._notice(row, text, task_id)
+            self._notice(row, text, task_id, 'steering')
             self._kick(task_id)  # An exceptional parent may have ended while this input was sending.
 
-    def _notice(self, row, text, task_id):
+    def _notice(self, row, text, task_id, purpose='notice'):
         # Chat flood control must not hold transport completion or executor slots.
+        if hasattr(self.channels[row['channel']], 'prepare_reply'):
+            self._queue_send(row, text, task_id, purpose=purpose)
+            return
         job = asyncio.create_task(self._send(row, text, task_id))
         self.notice_jobs.setdefault(task_id, set()).add(job)
         def forget(done):
@@ -239,11 +303,39 @@ class Gateway:
             return f"#t{task_id} {task_title(task)}\n"
         return ""
 
-    async def _send(self, row, text, task_id=None, buttons=None):
+    def _queue_send(self, row, text, task_id=None, buttons=None, purpose='reply'):
+        channel = self.channels[row['channel']]
+        if task_id is not None:
+            text = self._label(row, task_id) + text
+        logical = f"inbound:{row['id']}:{purpose}"
+        channel.prepare_reply(row['chat_id'], text, logical, task_id, None, buttons)
+        job = asyncio.create_task(self._retry_notice(channel, row['chat_id'], logical))
+        self.notice_jobs.setdefault(task_id, set()).add(job)
+        job.add_done_callback(lambda done: self.notice_jobs.get(task_id, set()).discard(done))
+
+    async def _retry_notice(self, channel, chat, logical):
+        try:
+            async with asyncio.timeout(self.delivery_timeout):
+                for delay in (0, *self.delivery_retry_delays):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    await channel.delivery.flush(chat, logical)
+                    if not channel.delivery.problems(chat, logical)[2]:
+                        return
+        except TimeoutError:
+            log.warning('Notice delivery remains pending after bounded retries')
+
+    async def _send(self, row, text, task_id=None, buttons=None, purpose='reply'):
+        channel = self.channels[row['channel']]
+        if hasattr(channel, 'prepare_reply'):
+            # Intent is durable under the conversation lock; network delivery
+            # never prevents polling from admitting a later /stop command.
+            self._queue_send(row, text, task_id, buttons, purpose)
+            return
         if task_id is not None:
             text = self._label(row, task_id) + text
         args = (row['chat_id'], text) + ((buttons,) if buttons is not None else ())
-        mid = await safe_call(self.channels[row['channel']].send, *args)
+        mid = await safe_call(channel.send, *args)
         if task_id is not None:
             self._remember(row, mid, task_id)
 
@@ -259,9 +351,78 @@ class Gateway:
     def _reply(self, row, task_id, turn_id):
         reply = Reply(self.channels[row['channel']], row['chat_id'], self.edit_interval,
                       lambda: self._label(row, task_id),
-                      lambda mid: self._remember(row, mid, task_id, turn_id))
+                      lambda mid: self._remember(row, mid, task_id, turn_id), f'turn:{turn_id}', task_id, turn_id)
         self.replies.add(reply)
         return reply
+
+    async def _prepare_output(self, row, turn_id, text, *, prepare_reply=True):
+        saved = self.storage.output(turn_id)
+        if saved is not None:
+            return saved
+        if hasattr(self.channels[row['channel']], 'deliver_files'):
+            text, artifacts = await asyncio.to_thread(snapshot_outputs, self.storage.state_dir, turn_id, text)
+        else:
+            artifacts = []
+        output = self.storage.save_output(turn_id, text or ('Files attached.' if artifacts else 'Task completed without a text answer.'), artifacts)
+        if prepare_reply:
+            self._prepare_final_reply(row, self.storage.turn_for(row['id'])['task_id'], turn_id, output['text'])
+        return output
+
+    def _prepare_final_reply(self, row, task_id, turn_id, text):
+        channel = self.channels[row['channel']]
+        if hasattr(channel, 'prepare_final'):
+            channel.prepare_final(row['chat_id'], self._label(row, task_id) + text, turn_id, task_id)
+
+    def _schedule_output(self, row, task_id, turn_id):
+        if turn_id in self.output_jobs or self.closing:
+            return
+        job = asyncio.create_task(self._deliver_output(row, task_id, turn_id))
+        self.output_jobs[turn_id] = job
+        job.add_done_callback(lambda done: self.output_jobs.pop(turn_id, None))
+
+    async def _deliver_output(self, row, task_id, turn_id, reply=None):
+        output = self.storage.output(turn_id)
+        if output is None or output['cancelled']:
+            return
+        self._prepare_final_reply(row, task_id, turn_id, output['text'])
+        channel = self.channels[row['channel']]
+        if hasattr(channel, 'deliver_files'):
+            logical = f'turn:{turn_id}:final'
+            unknown, failed, pending = 0, 0, 0
+            try:
+                async with asyncio.timeout(self.delivery_timeout):
+                    for delay in (0, *self.delivery_retry_delays):
+                        if delay:
+                            await asyncio.sleep(delay)
+                        if self.storage.output(turn_id)['cancelled']:
+                            return
+                        await channel.deliver_files(row['chat_id'], json.loads(output['artifacts']), logical, task_id, turn_id)
+                        unknown, failed, pending = channel.delivery.problems(row['chat_id'], logical)
+                        if not pending:
+                            break
+            except TimeoutError:
+                unknown, failed, pending = channel.delivery.problems(row['chat_id'], logical)
+            if channel.delivery.settled(row['chat_id'], logical):
+                self.storage.output_delivered(turn_id)
+                if channel.delivery.problems(row['chat_id'], f'turn:{turn_id}')[0]:
+                    self._notice(row, 'Earlier progress delivery was unconfirmed. The final reply was sent.', task_id, 'preview-status')
+            if unknown or failed or pending:
+                message = ('Some reply parts have unconfirmed delivery and were not resent. ' if unknown else '')
+                message += ('Some reply parts were refused or unavailable. ' if failed else '')
+                message += ('Some reply parts are still pending after delivery retries. ' if pending else '')
+                message += 'The result is retained in Eivoh.'
+                self._notice(row, message, task_id, 'output-status')
+            return
+        owned = reply is None
+        reply = reply or self._reply(row, task_id, turn_id)
+        try:
+            reply.update(output['text'], final=True)
+            await reply.finish()
+            self.storage.output_delivered(turn_id)
+        finally:
+            if owned:
+                await reply.cancel()
+                self.replies.discard(reply)
 
     def _target(self, row, explicit=None):
         conv = row['conversation_id']
@@ -381,6 +542,10 @@ class Gateway:
         jobs = [jobs[t] for t in targets for jobs in (self.workers, self.title_jobs) if t in jobs]
         jobs += [job for t in targets for job in self.steer_jobs.get(t, ())]
         jobs += [job for t in targets for job in self.notice_jobs.get(t, ())]
+        jobs += [job for inbound_id, job in self.media_jobs.items()
+                 if self.storage.turn_for(inbound_id)['task_id'] in targets]
+        jobs += [job for turn_id, job in self.output_jobs.items()
+                 if self.storage.db.execute('SELECT task_id FROM turn WHERE id=?', (turn_id,)).fetchone()[0] in targets]
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
@@ -395,6 +560,8 @@ class Gateway:
             if not pending:
                 return
             row = pending[0]
+            if row['preparation'] == 'pending':
+                return  # Preparation completion kicks this immutable task again.
             # Do not claim a turn while waiting: queued stays queued, and /model
             # may still change its launch settings until the slot is acquired.
             # The slot bounds executor processes only: it is released before the
@@ -410,20 +577,28 @@ class Gateway:
                 pending_turn = self.storage.turn_for(row['id'])
                 if pending_turn['status'] not in {'queued', 'running'}:
                     continue
+                if row['preparation'] == 'failed':
+                    await self._prepare_output(row, pending_turn['id'], row['prepared_text'])
+                    self.storage.finish(pending_turn['id'], 'failed', 'Attachment preparation failed')
+                    release()
+                    if hasattr(self.channels[row['channel']], 'deliver_files'):
+                        self._schedule_output(row, task_id, pending_turn['id'])
+                    else:
+                        await self._deliver_output(row, task_id, pending_turn['id'])
+                    continue
                 result = self.storage.stored_result(pending_turn['id'])
-                if result is not None:
-                    text, error = result
+                prepared_output = self.storage.output(pending_turn['id'])
+                if result is not None or prepared_output is not None:
+                    text, error = result if result is not None else (prepared_output['text'], 'Recovered prepared terminal failure')
+                    await self._prepare_output(row, pending_turn['id'], (text + f'\n\nTask failed: {error}' if error else text))
                     self.storage.finish(pending_turn['id'], 'failed' if error else 'completed', error)
                     release()
                     if not error:
                         self._name_task(task_id)
-                    reply = self._reply(row, task_id, pending_turn['id'])
-                    reply.update((text + f"\n\nTask failed: {error}" if error else text) or 'Task completed without a text answer.')
-                    try:
-                        await reply.finish()
-                    finally:
-                        await reply.cancel()
-                        self.replies.discard(reply)
+                    if hasattr(self.channels[row['channel']], 'deliver_files'):
+                        self._schedule_output(row, task_id, pending_turn['id'])
+                    else:
+                        await self._deliver_output(row, task_id, pending_turn['id'])
                     continue
                 turn, recovering = self.storage.claim(row['id'], self.max_recoveries)
                 if turn is None:
@@ -484,11 +659,14 @@ class Gateway:
         completed = False
         current_deltas = False
         try:
-            prompt = self.storage.prepare_prompt(turn, self.storage.input_text(row['id']))
+            request = self.storage.input_text(row['id'])
+            if hasattr(channel, 'deliver_files'):
+                request += output_instructions(self.storage.state_dir, turn['id'])
+            prompt = self.storage.prepare_prompt(turn, request)
             if recovering and turn['resume_id']:
                 prompt = f"{RESTART_PROMPT}\n\nOriginal request:\n{prompt}" + self.storage.recovery_inputs(turn['id'])
             if recovering:
-                await self._send(row, f"Service restarted; recovering task {turn['task_id']} (attempt {turn['recovery_count']}/{self.max_recoveries}).", turn['task_id'])
+                await self._send(row, f"Service restarted; recovering task {turn['task_id']} (attempt {turn['recovery_count']}/{self.max_recoveries}).", turn['task_id'], purpose='recovery')
             executor = self.executors.get(turn["executor"])
             if executor is None:
                 raise RuntimeError(f"Executor {turn['executor']} is not configured")
@@ -546,14 +724,21 @@ class Gateway:
                 return  # Exit/error during shutdown is recoverable, not terminal.
             if not completed and error is None:
                 error = "Executor ended without a completed turn"
+            final_text = text + f'\n\nTask failed: {error}' if error else text
+            await self._prepare_output(row, turn['id'], final_text, prepare_reply=not hasattr(channel, 'deliver_files'))
             self.storage.finish(turn["id"], "failed" if error else "completed", error)
             release()
             if not error:
                 self._name_task(turn['task_id'])
-            if error:
-                text += f"\n\nTask failed: {error}"
-            reply.update(text or "Task completed without a text answer.")
-            await reply.finish()
+            if hasattr(channel, 'deliver_files'):
+                # Allow an in-flight preview to acknowledge before adopting its
+                # id. Immediate cancellation could make a normal fast answer
+                # ambiguous. The bounded drain remains interruptible by /stop.
+                await reply.finish()
+                await reply.cancel()
+                self._schedule_output(row, turn['task_id'], turn['id'])
+            else:
+                await self._deliver_output(row, turn['task_id'], turn['id'], reply)
         except asyncio.CancelledError:
             # /stop has already persisted cancellation; shutdown leaves running.
             raise
@@ -620,8 +805,8 @@ class Gateway:
 
     async def idle(self):
         """Wait for accepted work; useful to embedding callers and tests."""
-        while any(not job.done() for job in self.workers.values()):
-            results = await asyncio.gather(*list(self.workers.values()), return_exceptions=True)
+        while any(not job.done() for job in [*self.workers.values(), *self.media_jobs.values(), *self.output_jobs.values()]):
+            results = await asyncio.gather(*list(self.workers.values()), *list(self.media_jobs.values()), *list(self.output_jobs.values()), return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
                     raise result
@@ -633,6 +818,7 @@ class Gateway:
     async def shutdown(self):
         self.begin_shutdown()
         jobs = [*self.workers.values(), *self.title_jobs.values(),
+                *self.media_jobs.values(), *self.output_jobs.values(),
                 *(job for jobs in self.steer_jobs.values() for job in jobs),
                 *(job for jobs in self.notice_jobs.values() for job in jobs)]
         for job in jobs:

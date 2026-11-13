@@ -11,6 +11,7 @@ EnvironmentFile=%h/.config/eivoh/env
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 KillMode=mixed
 TimeoutStopSec=20
 UMask=0077

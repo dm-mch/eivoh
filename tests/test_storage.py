@@ -81,7 +81,7 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
 def test_schema_version_reopen_and_future_rejected(tmp_path):
     path = tmp_path / 'version.db'
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 5
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 6
     store.journal(inbound(1, 'retained'))
     store.close()
     store = Storage(path)
@@ -90,6 +90,29 @@ def test_schema_version_reopen_and_future_rejected(tmp_path):
     store.close()
     with pytest.raises(ValueError, match='Unsupported schema version 99'):
         Storage(path)
+
+
+def test_v5_migration_preserves_interrupted_telegram_part_ids(tmp_path):
+    from eivoh.storage import MIGRATIONS
+    path = tmp_path / 'v5.db'
+    with sqlite3.connect(path) as db:
+        for migration in MIGRATIONS[:5]:
+            for statement in migration:
+                db.execute(statement)
+        db.execute('PRAGMA user_version=5')
+        db.execute("INSERT INTO conversation(id,channel,chat_id) VALUES (1,'telegram','10')")
+        db.execute("INSERT INTO task(id,conversation_id,executor,title,title_source) VALUES (1,1,'codex','Keep name','manual')")
+        db.execute("INSERT INTO inbound(id,conversation_id,channel,chat_id,user_id,message_id,text,state) VALUES (1,1,'telegram','10','1','1','input','running')")
+        db.execute("INSERT INTO turn(id,inbound_id,conversation_id,task_id,status,executor) VALUES (1,1,1,1,'running','codex')")
+        db.execute("INSERT INTO task_session VALUES (1,'codex','native-thread',0)")
+        db.executemany("INSERT INTO outbound VALUES ('telegram','10',?,1,1)", [('100',), ('99',)])
+    storage = Storage(path)
+    parts = storage.delivery_parts('telegram', '10', 'turn:1')
+    assert [(part['part'], part['message_id']) for part in parts] == [('0', '99'), ('1', '100')]
+    assert storage.session(1, 'codex')['session_id'] == 'native-thread'
+    assert storage.task(1, 1)['title'] == 'Keep name'
+    assert not storage.db.execute('PRAGMA foreign_key_check').fetchall()
+    storage.close()
 
 
 def test_ordered_migrations_rollback_together(tmp_path, monkeypatch):
@@ -141,7 +164,7 @@ def test_v1_upgrades_in_place(tmp_path):
                    "VALUES (1,1,1,1,'running','old-session')")
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 6
         task = store.active_task(1)
         assert task['model'] is None and task['session_id'] == 'old-session'
         turn, recovering = store.claim(1, 3)

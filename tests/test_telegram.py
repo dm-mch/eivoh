@@ -95,7 +95,9 @@ async def test_typing_survives_task_switch_during_edit_flood(tmp_path, monkeypat
         bot.send_chat_action.side_effect = [RetryAfter(5), True, True, True]
         await until(lambda: bot.send_chat_action.call_count >= previous + 2)
         bot.send_chat_action.side_effect = None
-        assert not switching.done() and store.turn_for(1)['status'] == 'running'
+        # The confirmation is background delivery; polling can admit the next
+        # command while both the edit and confirmation wait on flood control.
+        assert switching.done() and store.turn_for(1)['status'] == 'running'
         assert 'Telegram flood control' in caplog.text and 'waiting 5 s' in caplog.text
         release.set()
         await switching
