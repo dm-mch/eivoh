@@ -67,6 +67,7 @@ EIVOH_WORKDIR=/home/your-user/src/eivoh
 # EIVOH_CODEX_BIN=codex
 # EIVOH_CODEX_MODEL=
 # EIVOH_CODEX_ARGS=
+# EIVOH_STT=soniox
 ```
 
 Set `EIVOH_WORKDIR` explicitly to the working tree the executor should edit,
@@ -206,8 +207,81 @@ Migration, routing, parallel limits, reply targets, task controls, per-executor
 sessions and restart recovery have offline fake-executor coverage. Live use of
 the parallel task interface and session switching changes is unverified.
 
-Only the numeric owner in a private chat is admitted. Use one instance and a
-dedicated token; multi-instance locking belongs to V2.
+Only the numeric owner in a private chat is admitted. Use a dedicated bot token.
+Before opening the database or contacting Telegram, the process takes an exclusive
+Linux file lock keyed by a hash of the token in `/tmp/eivoh-pollers-<uid>/`.
+The directory and lock file are private to the Unix user; the lock inode is never
+unlinked. Separate state directories do not bypass this lock, and process exit
+releases it. This protects one Unix user on one machine, not other machines or
+users. Polling conflicts with a remote consumer retry after 10, 20, 30 and 45
+seconds; five conflicts within five minutes stop with exit status 78. A single
+successful poll does not reset that budget. The supplied unit excludes status 78
+from automatic restarts: stop the competing consumer, then start Eivoh again.
+
+Telegram photos, documents, voice and audio are admitted to SQLite before any
+download or transcription. Captions are content, including captions starting with
+`/stop`, `/new` or `/q`. Files without captions are requests too. Each album item
+is an ordered message with its album identifier retained; it is not combined into
+one synthetic turn. Task and reply routing are fixed at admission. Two background
+preparations may run at once, with a 180-second deadline; a pending file is a FIFO
+barrier for later input to that task. Commands remain usable during preparation.
+As with queued text, `/model` can change the executor selected before launch;
+prepared input can steer an eligible running turn without changing that turn's
+output directory. `/stop` cancels preparation and prevents a late result from
+starting work. Restart uses the saved descriptors and existing completed downloads.
+
+Downloads are streamed with a hard 20 MB byte limit, a 90-second download deadline,
+and at most ten files per message. Files live under `EIVOH_STATE_DIR/files/inputs/`,
+outside the public checkout; keep `EIVOH_STATE_DIR` in private storage. Original
+filenames are display metadata, never destination paths. Generated local names,
+atomic publication and symlink checks protect stored paths. Claude and Codex get
+the same JSON path manifest with instructions to inspect files/images using their
+native tools. Prepared input paths and selected output snapshots are retained in
+the handoff transcript, subject to its existing length limit. Prior outputs are
+labelled as files for reading, without claiming Telegram received them; revisions
+belong in the current turn's output directory. An unsupported format is still
+available as a file; archives are not automatically extracted. Failed preparation
+is reported and does not launch the executor. Voice/audio use `EIVOH_STT=soniox`
+with the provider's `SONIOX_API_KEY`; the stored transcript is echoed to the chat.
+Transcription after a crash before its result was committed can repeat.
+
+Each launched turn gets a private output directory at
+`EIVOH_STATE_DIR/files/outputs/<turn-id>/`. To send a result as an actual attachment,
+the executor writes a file there and adds one exact line per artifact to its final
+answer:
+
+```text
+EIVOH_ARTIFACT {"path":"report.txt","kind":"document"}
+EIVOH_ARTIFACT {"path":"figure.png","kind":"photo"}
+```
+
+Paths must be relative to that turn's directory. Only final, unfenced marker lines
+are interpreted; protocol lines and partial streamed prefixes are hidden from the
+chat, while raw executor events retain the evidence. At most ten regular files,
+50 MB each and 100 MB total, are selected. Traversal, symlinks and hardlinks are
+rejected. Files are copied into durable snapshots with hashes before the turn is
+marked complete. Changing an original afterward does not change a queued upload.
+JPEG/PNG files up to 10 MB use Telegram photos; other files and definitively refused
+photo formats/dimensions fall back to documents. Each delivered attachment maps
+back to its task for reply routing. A filesystem path by itself, a file elsewhere,
+or an unselected file in the output directory is never uploaded automatically.
+Unsupported Telegram media types, including video/sticker messages, receive an
+explicit notice; their captions stay in the inbound journal. Send them as documents
+to make their bytes available to the executor. Snapshot copying, upload hashing
+and voice-file reads run off the event loop. Cancellation may leave a bounded local
+copy/read finishing in the background, but it cannot publish a stopped task's output.
+Telegram's cloud limits are documented in its [file API](https://core.telegram.org/bots/api#getfile),
+[photo API](https://core.telegram.org/bots/api#sendphoto) and
+[document API](https://core.telegram.org/bots/api#senddocument).
+Files and delivery journals currently remain in private state; retention and cleanup
+are separate decisions. Restart backups must include both SQLite and `files/`.
+
+Offline transport tests cover these limits, routing, cancellation and delivery
+windows. Isolated real Claude and Codex Gateway probes inspected a synthetic image
+and document, accepted a file clarification during a running turn, produced file
+outputs, and recovered completed delivery without new executor calls. Telegram
+network calls were mocked in those probes; real Telegram file transfer remains
+unverified.
 
 The service uses a separate detached release worktree at
 `~/.local/share/eivoh/run`, with its own venv. Editing the executor's working tree
@@ -290,6 +364,13 @@ Migration 5 adds explicit queue intent and steering delivery records linking eac
 input to its parent turn. Raw acknowledgement and accepted state commit together.
 Accepted inputs join the parent transcript with one final answer and are never
 launched as separate turns. Sessions and title provenance remain intact.
+Migration 6 adds media descriptors/preparation, update receipts and an expiring
+poll cursor, final output manifests, delivery parts and request attempts. Existing
+known Telegram message IDs for interrupted turns seed the new delivery parts in
+numeric order, so recovery can edit them. It preserves task/session/title data.
+Completed legacy turns are not replayed; ambiguous legacy sends without a recorded
+ID cannot be reconstructed. Restoring an older database does not by itself restore
+or remove files.
 Older releases reject newer schema versions. A rollback needs a
 compatible release or a separately planned database restore.
 Conversations point to one current task among their open tasks; turns retain
@@ -318,7 +399,9 @@ ID alone does not acknowledge receipt of the first prompt. Legacy pending turns
 without prompt metadata reconstruct it using the session's transcript progress.
 Real isolated Gateway probes for both adapters covered steering, queue order,
 native resume, cleanup on stop, and recovery after durable input acceptance.
-These used a local channel; end-to-end Telegram steering remains unverified.
+These used a local channel. Codex steering was also observed once end to end in
+Telegram with three clarifications retained in one answer; Claude Telegram steering
+remains unverified.
 
 Inputs with an uncertain delivery outcome remain queued with a visible notice;
 the next prompt explicitly asks the executor to check whether they were already
@@ -329,13 +412,51 @@ Three automatic recovery attempts are allowed
 per turn before visible failure. Errors/results emitted after shutdown begins
 remain in the raw journal but cannot finalize the interrupted turn on replay.
 External tool effects are not exactly-once: an action may precede its persisted
-result. The IDs of every part of an answer or task-specific notice are durable for reply routing;
-split-message edit state and delivery acknowledgments remain ephemeral, so recovery
-can still post a new answer. A crash between sending and storing an outbound ID
-can leave that message without a reply mapping.
-Polling honors flood-control delays without advancing its offset. Final answer
-delivery waits up to 60 seconds, including flood-control backoff, and is cancelled
-by shutdown. Ambiguous send timeouts are not retried. Interactive approvals are not implemented;
+result. Desired text chunks and attachments have durable logical identities. Each
+physical request records its payload and revision before the network call; a
+confirmed message ID and its task mapping commit before the next part is sent.
+Recovery edits known IDs and sends only known-unsent parts. A newer final answer
+cannot be acknowledged by an older in-flight progress update. A fresh send that
+times out or loses its acknowledgement becomes `unknown`, including after a crash;
+it is never automatically reposted. Confirmed connection establishment or pool
+failures are known-unsent and remain retryable. Progress and final replies have
+separate stable identities. Final delivery adopts confirmed progress message IDs;
+if an uncertain preview contains only different progress content, a new final send
+is allowed. Actual attempted visible text is checked across all uncertain preview
+parts, including plaintext fallbacks and tool suffixes. A preview that may already
+contain the final answer preserves that uncertainty, and an uncertain final never
+gets another identity after restart. Final identity creation and adoption commit
+together. Later text chunks are held behind an uncertain
+prefix. File parts retain their own identities. A separate notice explains an
+uncertain/refused/pending delivery; the result and snapshots stay in storage.
+This can omit a part that Telegram never received, but avoids blind retries of
+possibly posted sends. It is not exactly-once delivery. A message whose ID was
+lost cannot have a known reply mapping. In the rare combination of a long answer,
+an uncertain preview chunk and a changing task label, text can reflow across chunk
+boundaries and a final chunk can repeat overlapping preview content. Definite
+markup/photo refusals and flood limits can be retried; known-message edits/deletes
+are safe to retry. Final output
+is persisted before terminal turn state, so a completed turn awaiting delivery
+does not require a new executor call. `/stop` also suppresses its task's unfinished
+delivery across restart.
+Pending final delivery retries in the background after 1, 2, 4, 8 and 16 seconds,
+within a five-minute overall deadline; uploads use write timeouts scaled by size.
+After these bounded retries are exhausted, unsent output remains pending until
+restart; successful polling or a later network recovery does not restart delivery.
+Transient pending delivery produces no immediate error notice. Commands persist
+their reply intent under the conversation lock and flush it in tracked background
+jobs, so an upload or flood wait cannot block admission of the next `/stop`.
+Notice identities use the inbound ID and purpose, independent of changing labels
+or task ages. Pending command replies also resume after restart without executing
+the command again.
+Polling commits accepted update receipts before advancing its cursor. Duplicate
+owner messages are removed by their durable channel/chat/message identity, before
+media preparation. Cursor/receipt hints expire after six idle days, including during
+an uninterrupted process, because Telegram can randomize update IDs after a week.
+Polling honors flood-control delays without advancing its offset. The existing
+progress request gets up to 60 seconds to acknowledge before final delivery adopts
+its known IDs; `/stop` and shutdown cancel both progress and final delivery.
+Ambiguous final sends are not retried. Interactive approvals are not implemented;
 result permission denials are surfaced. Markdown supports headings, emphasis,
 links and code, with balanced HTML chunks conservatively limited to 4096 UTF-16
 units including markup. Other syntax remains readable text.

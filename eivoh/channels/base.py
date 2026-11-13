@@ -11,6 +11,8 @@ class Inbound:
     text: str
     reply_to: str | None = None
     button: bool = False  # A press of a button the gateway sent; its text is a command.
+    attachments: tuple[dict, ...] = ()  # Channel descriptors, prepared after admission.
+    update_id: int | None = None
 
 
 class Channel(Protocol):

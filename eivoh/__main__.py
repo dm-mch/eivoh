@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from .channels.telegram import TelegramChannel
+from .channels.locking import ConsumerConflict, TokenLock
 from .config import Config
 from .executors.claude import ClaudeStreamExecutor
 from .executors.codex_app import CodexAppExecutor
@@ -16,6 +17,13 @@ from .titles import ClaudeTitleExecutor, CodexTitleExecutor
 
 
 async def serve(config: Config):
+    # Across distinct state directories too. No database, executor or Bot exists
+    # until the process owns this token's canonical same-user lock.
+    with TokenLock(config.telegram_token):
+        await _serve_locked(config)
+
+
+async def _serve_locked(config: Config):
     os.umask(0o077)
     storage = Storage(config.state_dir / "eivoh.sqlite3", config.default_executor)
     executors = {
@@ -51,7 +59,7 @@ async def serve(config: Config):
             try:
                 done, _ = await asyncio.wait([poll, stop], return_when=asyncio.FIRST_COMPLETED)
                 if poll in done:
-                    await poll  # Configuration/conflict failures trigger systemd restart.
+                    await poll
             finally:
                 # Stop polling before children; running tasks stay recoverable.
                 gateway.begin_shutdown()
@@ -72,7 +80,11 @@ def main():
     # HTTP URLs contain the bot token. Never log request URLs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    asyncio.run(serve(Config.from_env()))
+    try:
+        asyncio.run(serve(Config.from_env()))
+    except ConsumerConflict as exc:
+        logging.getLogger(__name__).error('%s', exc)
+        raise SystemExit(78) from None
 
 
 if __name__ == "__main__":

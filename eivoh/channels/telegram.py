@@ -6,13 +6,18 @@ original splitting/formatting/typing and dispatch implementation, no copied code
 import asyncio
 from datetime import timedelta
 import logging
+import json
+from pathlib import Path
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TelegramError
 
 from ..speech import TranscriptionError
 from .base import Inbound
 from .formatting import plain_text, render_chunks
+from .delivery import TelegramDelivery
+from .locking import ConsumerConflict
+from ..attachments import AttachmentError, INPUT_LIMIT, MAX_FILES, download_file, input_manifest, input_path
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +33,78 @@ class TelegramChannel:
         self.locks = {}
         self.blocked_until = {}
         self.messages = {}  # logical first id -> chunk ids; V1 delivery state is ephemeral
+        self.storage = None
+
+    def bind(self, storage):
+        self.storage = storage
+        self.delivery = TelegramDelivery(self, storage)
+
+    async def deliver(self, chat, text, logical, task_id=None, turn_id=None, buttons=None):
+        mid = await self.delivery.text(chat, logical, text, task_id, turn_id, buttons)
+        if mid is not None:
+            self.messages[(chat, mid)] = [row['message_id'] for row in self.storage.delivery_parts('telegram', chat, logical)
+                                          if row['part'].isdecimal() and row['message_id'] is not None]
+        return mid
+
+    def prepare_reply(self, chat, text, logical, task_id=None, turn_id=None, buttons=None):
+        self.delivery.prepare_text(chat, logical, text, task_id, turn_id, buttons)
+
+    def prepare_final(self, chat, text, turn_id, task_id):
+        self.delivery.prepare_final(chat, f'turn:{turn_id}', f'turn:{turn_id}:final', text, task_id, turn_id)
+
+    async def deliver_files(self, chat, artifacts, logical, task_id, turn_id):
+        await self.delivery.files(chat, logical, artifacts, task_id, turn_id)
+        rows = self.storage.delivery_parts('telegram', chat, logical)
+        ids = [row['message_id'] for row in rows if row['part'].isdecimal() and row['message_id'] is not None]
+        if ids:
+            self.messages[(chat, ids[0])] = ids
+
+    @staticmethod
+    def log_flood(method, seconds):
+        log.warning('Telegram flood control on %s: waiting %.0f s', getattr(method, '__name__', 'request'), seconds)
+
+    async def prepare(self, row):
+        items = json.loads(row['attachments'])
+        if len(items) > MAX_FILES:
+            raise AttachmentError('Too many input files (maximum 10 per message)')
+        prepared = []
+        text = row['text']
+        for index, original in enumerate(items):
+            item = dict(original)
+            if item['kind'] == 'unsupported':
+                raise AttachmentError('This Telegram media type is not supported; send it as a document or photo.')
+            if item.get('size') is not None and item['size'] > INPUT_LIMIT:
+                raise AttachmentError('Attachment exceeds the 20 MB download limit')
+            name = item.get('name') or ('voice.ogg' if item['kind'] == 'voice' else 'image.jpg' if item['kind'] == 'photo' else 'file.bin')
+            path = input_path(self.storage.state_dir, row['id'], index, name)
+            if path.is_symlink():
+                raise AttachmentError('Stored attachment path is unsafe')
+            if not path.exists():
+                file = await self.bot.get_file(item['file_id'])
+                if getattr(file, 'file_size', None) is not None and file.file_size > INPUT_LIMIT:
+                    raise AttachmentError('Attachment exceeds the 20 MB download limit')
+                url = getattr(file, 'file_path', None)
+                # Production Bot.get_file returns an absolute cloud HTTPS URL.
+                # Local Bot API servers are not enabled by this application.
+                if not isinstance(url, str) or not url.startswith('https://'):
+                    raise AttachmentError('Telegram did not provide a downloadable file')
+                await download_file(url, path)
+            if not path.is_file() or path.stat().st_size > INPUT_LIMIT:
+                raise AttachmentError('Stored attachment is unavailable or too large')
+            item.update(name=name, path=str(path), size=path.stat().st_size)
+            prepared.append(item)
+            if item['kind'] == 'voice':
+                if self.transcriber is None:
+                    raise AttachmentError('Voice messages are not configured (set EIVOH_STT).')
+                audio = await asyncio.to_thread(path.read_bytes)
+                transcript = await self.transcriber.transcribe(audio, name)
+                if not transcript:
+                    raise AttachmentError('The voice message transcript is empty.')
+                text = VOICE_PREFIX + transcript + ('\n\nCaption: ' + text if text else '')
+        ordinary = [item for item in prepared if item['kind'] != 'voice']
+        if ordinary:
+            text = (text or 'Please inspect the attached file(s).') + input_manifest(ordinary)
+        return text, prepared
 
     async def poll(self, receive):
         try:
@@ -42,8 +119,11 @@ class TelegramChannel:
             ])
         except Exception as exc:
             log.warning("Telegram command registration failed: %s", type(exc).__name__)
-        offset = None
+        offset = self.storage.cursor('telegram') if self.storage else None
+        conflicts = []
         while True:
+            if self.storage and self.storage.cursor('telegram') is None:
+                offset = None  # Also expire offsets during uninterrupted idle polling.
             try:
                 updates = await self.bot.get_updates(offset=offset, timeout=30, read_timeout=35,
                                                      allowed_updates=["message", "callback_query"])
@@ -52,11 +132,25 @@ class TelegramChannel:
                 delay = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
                 await asyncio.sleep(delay + 0.1)
                 continue
+            except Conflict:
+                now = asyncio.get_running_loop().time()
+                conflicts = [when for when in conflicts if now - when < 300]
+                conflicts.append(now)
+                if len(conflicts) >= 5:
+                    raise ConsumerConflict('Telegram polling repeatedly conflicts with another consumer; stop the other consumer before restarting') from None
+                delay = (10, 20, 30, 45)[len(conflicts) - 1]
+                log.warning('Telegram polling conflict; retrying in %s s', delay)
+                await asyncio.sleep(delay)
+                continue
             except NetworkError:
                 log.warning("Telegram polling network error; retrying")
                 await asyncio.sleep(2)
                 continue
             for update in updates:
+                if self.storage and self.storage.saw_update('telegram', update.update_id):
+                    offset = update.update_id + 1
+                    self.storage.advance_cursor('telegram', offset)
+                    continue
                 message = update.effective_message
                 user = update.effective_user
                 chat = update.effective_chat
@@ -65,19 +159,34 @@ class TelegramChannel:
                 reply_to = str(replied.message_id) if replied else None
                 if not user or user.id != self.owner_id or not chat or chat.type != "private":
                     log.info("Ignored Telegram update from non-owner or non-private chat")
+                    if self.storage:
+                        with self.storage.db:
+                            self.storage.receipt('telegram', update.update_id)
                 elif callback:
                     try:
                         await callback.answer()
                     except TelegramError:
                         log.warning("Could not acknowledge Telegram callback")
                     if isinstance(callback.data, str):
-                        await receive(Inbound("telegram", str(chat.id), str(user.id),
-                                              f"cb:{callback.id}", callback.data, button=True))
+                        accepted = await receive(Inbound("telegram", str(chat.id), str(user.id),
+                                              f"cb:{callback.id}", callback.data, button=True, update_id=update.update_id))
+                        if accepted is False:
+                            return
+                    elif self.storage:
+                        with self.storage.db:
+                            self.storage.receipt('telegram', update.update_id)
+                elif message and self.storage and self._media(message):
+                    accepted = await receive(Inbound('telegram', str(chat.id), str(user.id), str(message.message_id),
+                        getattr(message, 'caption', None) or '', reply_to, attachments=tuple(self._media(message)), update_id=update.update_id))
+                    if accepted is False:
+                        return
                 elif message and message.text:
                     # Do not request the next offset (acknowledge the batch) until
                     # the gateway has committed each accepted inbound to SQLite.
-                    await receive(Inbound("telegram", str(chat.id), str(user.id),
-                                          str(message.message_id), message.text, reply_to))
+                    accepted = await receive(Inbound("telegram", str(chat.id), str(user.id),
+                                          str(message.message_id), message.text, reply_to, update_id=update.update_id))
+                    if accepted is False:
+                        return
                 elif message and (message.voice or message.audio):
                     # Transcribed before journaling: a crash here leaves the update
                     # unacknowledged, so it is fetched and transcribed again.
@@ -85,7 +194,32 @@ class TelegramChannel:
                     if text:
                         await receive(Inbound("telegram", str(chat.id), str(user.id),
                                               str(message.message_id), VOICE_PREFIX + text, reply_to))
+                elif self.storage:
+                    with self.storage.db:
+                        self.storage.receipt('telegram', update.update_id)
                 offset = update.update_id + 1
+                if self.storage:
+                    self.storage.advance_cursor('telegram', offset)
+
+    @staticmethod
+    def _media(message):
+        media, kind = None, None
+        if getattr(message, 'voice', None) or getattr(message, 'audio', None):
+            media, kind = getattr(message, 'voice', None) or message.audio, 'voice'
+        elif getattr(message, 'document', None):
+            media, kind = message.document, 'document'
+        elif getattr(message, 'photo', None):
+            media, kind = message.photo[-1], 'photo'
+        else:
+            for field in ('video', 'animation', 'sticker', 'video_note'):
+                if getattr(message, field, None):
+                    media, kind = getattr(message, field), 'unsupported'
+                    break
+        if media is None:
+            return []
+        return [dict(file_id=media.file_id, kind=kind, name=getattr(media, 'file_name', None),
+                     size=getattr(media, 'file_size', None), mime_type=getattr(media, 'mime_type', None),
+                     album=getattr(message, 'media_group_id', None))]
 
     async def _transcribe(self, chat, media):
         if self.transcriber is None:

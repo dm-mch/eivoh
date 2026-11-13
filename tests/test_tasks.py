@@ -386,7 +386,7 @@ def test_migration_three_preserves_v2_sessions_turns_and_legacy_column(tmp_path)
         db.execute("INSERT INTO raw_event(turn_id,sequence,stream,payload,kinds,events,created_at) VALUES (2,1,'meta',?,'[]','[]','2099-01-01 00:00:00')", (payload,))
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 6
         assert dict(store.session(1, 'claude')) == {'task_id': 1, 'executor': 'claude', 'session_id': 'old-session', 'synced_inbound_id': 1}
         assert store.task(1, 1)['session_id'] == 'old-session'
         assert store.task(1, 1)['last_active'] == '2099-01-01 00:00:00'
