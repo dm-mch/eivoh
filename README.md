@@ -431,13 +431,18 @@ prefix. File parts retain their own identities. A separate notice explains an
 uncertain/refused/pending delivery; the result and snapshots stay in storage.
 This can omit a part that Telegram never received, but avoids blind retries of
 possibly posted sends. It is not exactly-once delivery. A message whose ID was
-lost cannot have a known reply mapping. Definite markup/photo refusals and flood
-limits can be retried; known-message edits/deletes are safe to retry. Final output
+lost cannot have a known reply mapping. In the rare combination of a long answer,
+an uncertain preview chunk and a changing task label, text can reflow across chunk
+boundaries and a final chunk can repeat overlapping preview content. Definite
+markup/photo refusals and flood limits can be retried; known-message edits/deletes
+are safe to retry. Final output
 is persisted before terminal turn state, so a completed turn awaiting delivery
 does not require a new executor call. `/stop` also suppresses its task's unfinished
 delivery across restart.
 Pending final delivery retries in the background after 1, 2, 4, 8 and 16 seconds,
 within a five-minute overall deadline; uploads use write timeouts scaled by size.
+After these bounded retries are exhausted, unsent output remains pending until
+restart; successful polling or a later network recovery does not restart delivery.
 Transient pending delivery produces no immediate error notice. Commands persist
 their reply intent under the conversation lock and flush it in tracked background
 jobs, so an upload or flood wait cannot block admission of the next `/stop`.
