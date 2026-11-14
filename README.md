@@ -215,13 +215,14 @@ Chat commands:
 * `/model [name or number]` shows or changes the target task's model as described above.
 * `/effort [level or default]` shows or changes the target task's reasoning effort.
 * `/q <text>` queues a message after the running turn and earlier queued messages.
+* `/usage` shows what is left of the Claude and Codex subscription limits, described below.
 
 For `/stop`, `/close`, `/model`, `/effort` and `/title`, an explicit task number (where the
 syntax allows one) takes priority, then a replied-to task, then the current task
 for typed commands. `/model #N …` and `/effort #N …` explicitly target task N;
 a bare number in `/model` selects a model, not a task. Unknown task numbers and tasks
 from another conversation are refused. Tasks are never automatically closed.
-Telegram registers new, tasks, model, effort, stop, q, close and title in its command menu;
+Telegram registers new, tasks, model, effort, stop, q, close, title and usage in its command menu;
 inline button commands use the same validation and durable deduplication as typing.
 
 After a new task's first successful text answer, a background request generates
@@ -245,6 +246,45 @@ not establish subscription spend. Title output does not enter the turn's answer,
 transcript or ordinary executor events.
 The CLI flags were checked on Claude Code 2.1.323 and codex-cli 0.167.2; unsupported
 flags in other versions cause a quiet fallback to the temporary title.
+
+Subscription limits: `/usage` answers, for Claude and for Codex, how much of each
+limit window is left and when it resets, under the provider's own window names.
+It creates no turn and works while tasks run: the command is finished at once and
+the answer follows from a background check (lost, not replayed, if the service
+stops first). Two sources feed it:
+
+* Live probes, run in parallel in an empty temporary directory with a 20-second
+  limit each, without API keys in the environment, under the same subreaper as
+  turns, so no descendant outlives a probe. Claude: `/usage` sent on stdin
+  to `claude -p --output-format json --no-session-persistence --safe-mode` with
+  tools and MCP disabled; only lines of the form `Current <window>: N% used · resets
+  <time>` are used, and an answer that reports an error, a turn or a cost counts as a
+  failed probe. Codex: `account/rateLimits/read` on a local `codex app-server`, which
+  reports used percent, window length, reset time, plan and limit reset credits;
+  account and credit ids are not kept. On Claude Code 2.1.323 and codex-cli 0.167.2
+  (2026-11-14) both probes took one to four seconds, Claude reported no turn and zero
+  cost, and Codex starts no thread or turn, so neither should spend from the limits;
+  this was not measured as a change of the percentages. Other versions are unverified.
+* Rate-limit events that ordinary turns already stream (Claude `rate_limit_event`,
+  Codex `account/rateLimits/updated`), noted as the turn runs.
+
+Results are kept in `usage.json` in the state directory (mode 0600), merged per
+window (Codex by limit and primary/secondary slot, Claude by window name): a newer
+observation of a window replaces the older one, and windows a turn event does not
+report (such as Claude's per-model week) keep their last value, shown with
+“(as of 2 h ago)” when older than the rest. Restrictions and notes come only from
+the newest result. A turn never waits for the store: if another process holds its
+lock, that observation is skipped at once. When a probe fails, `/usage` shows the stored data with its
+age and source (for example “last seen in a turn 2 h ago”) and the probe error;
+with nothing stored the executor is “unknown”. Reset times are shown as time left
+when the provider gives an exact time; Claude's text is converted using its time
+zone, otherwise shown as written. Percentages are what the providers report, not
+estimates. The agent reads the same data inside a turn with
+`python -m eivoh usage` (live probes, plain text), `--json` (snapshots) or
+`--cached` (stored data only, no probes), run with the service's interpreter
+(`~/.local/share/eivoh/run/.venv/bin/python` in the deployed layout). It needs no Telegram token and uses
+`EIVOH_STATE_DIR`, `EIVOH_CLAUDE_BIN` and `EIVOH_CODEX_BIN`. Several Codex limits
+at once, Claude's text in other locales and `/usage` in live Telegram are unverified.
 
 Answers and task-specific notices get a `#tN Title` label when more than one task
 is open or the answer belongs to a task other than the current one. Labels are

@@ -892,7 +892,7 @@ class Storage:
         return [(t['id'], t['task_id']) for t in turns if t['status'] == 'running'], sum(t['status'] == 'queued' for t in turns)
 
 
-COMMANDS = frozenset({'/new', '/tasks', '/task', '/model', '/effort', '/stop', '/close', '/title', '/q'})
+COMMANDS = frozenset({'/new', '/tasks', '/task', '/model', '/effort', '/stop', '/close', '/title', '/q', '/usage'})
 
 
 def now():

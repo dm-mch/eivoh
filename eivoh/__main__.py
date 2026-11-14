@@ -1,7 +1,11 @@
+import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
+import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -14,6 +18,7 @@ from .gateway import Gateway
 from .speech import make_transcriber
 from .storage import LegacyWorkdirRequired, Storage
 from .titles import ClaudeTitleExecutor, CodexTitleExecutor
+from .usage import UsageService, format_usage
 
 
 async def serve(config: Config):
@@ -44,7 +49,8 @@ async def _serve_locked(config: Config):
     title_executors = {'claude': ClaudeTitleExecutor(title_workdir, config.claude_bin),
                        'codex': CodexTitleExecutor(title_workdir, config.codex_bin)}
     gateway = Gateway(storage, executor, {"telegram": channel}, executors=executors,
-                      max_parallel=config.max_parallel, title_executors=title_executors)
+                      max_parallel=config.max_parallel, title_executors=title_executors,
+                      usage=UsageService(config.state_dir, config.claude_bin, config.codex_bin))
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     def stop_requested():
@@ -77,7 +83,24 @@ async def _serve_locked(config: Config):
             loop.remove_signal_handler(sig)
 
 
-def main():
+def usage_main(argv):
+    """`python -m eivoh usage`: the same data for the agent, without the Telegram token."""
+    parser = argparse.ArgumentParser(prog='python -m eivoh usage', description='Subscription limits left.')
+    parser.add_argument('--json', action='store_true', help='machine-readable snapshots')
+    parser.add_argument('--cached', action='store_true', help='no live probes, only the stored data')
+    args = parser.parse_args(argv)
+    os.umask(0o077)
+    state_dir = Path(os.environ.get("EIVOH_STATE_DIR", "~/.local/state/eivoh")).expanduser().resolve()
+    service = UsageService(state_dir, os.environ.get("EIVOH_CLAUDE_BIN", "claude"),
+                           os.environ.get("EIVOH_CODEX_BIN", "codex"))
+    snapshots = asyncio.run(service.snapshot(live=not args.cached))
+    print(json.dumps(snapshots, ensure_ascii=False, indent=2) if args.json else format_usage(snapshots, time.time()))
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['usage']:
+        return usage_main(argv[1:])
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # HTTP URLs contain the bot token. Never log request URLs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
