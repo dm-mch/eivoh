@@ -267,8 +267,10 @@ stops first). Two sources feed it:
 * Rate-limit events that ordinary turns already stream (Claude `rate_limit_event`,
   Codex `account/rateLimits/updated`), noted as the turn runs.
 
-The newest successful result per executor is kept in `usage.json` in the state
-directory (mode 0600). When a probe fails, `/usage` shows the stored data with its
+Results are kept in `usage.json` in the state directory (mode 0600), merged by
+window name: a newer observation of a window replaces the older one, and windows a
+turn event does not report (such as Claude's per-model week) keep their last value,
+shown with “(as of 2 h ago)” when older than the rest. When a probe fails, `/usage` shows the stored data with its
 age and source (for example “last seen in a turn 2 h ago”) and the probe error;
 with nothing stored the executor is “unknown”. Reset times are shown as time left
 when the provider gives an exact time; Claude's text is converted using its time
@@ -277,9 +279,8 @@ estimates. The agent reads the same data inside a turn with
 `python -m eivoh usage` (live probes, plain text), `--json` (snapshots) or
 `--cached` (stored data only, no probes), run with the service's interpreter
 (`~/.local/share/eivoh/run/.venv/bin/python` in the deployed layout). It needs no Telegram token and uses
-`EIVOH_STATE_DIR`, `EIVOH_CLAUDE_BIN` and `EIVOH_CODEX_BIN`. A stored Codex event
-covers only the limit it reports; several Codex limits at once, Claude's text in
-other locales and `/usage` in live Telegram are unverified.
+`EIVOH_STATE_DIR`, `EIVOH_CLAUDE_BIN` and `EIVOH_CODEX_BIN`. Several Codex limits
+at once, Claude's text in other locales and `/usage` in live Telegram are unverified.
 
 Answers and task-specific notices get a `#tN Title` label when more than one task
 is open or the answer belongs to a task other than the current one. Labels are

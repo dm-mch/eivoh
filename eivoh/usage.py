@@ -4,7 +4,8 @@ Formats observed on Claude Code 2.1.323 and codex-cli 0.167.2 (2026-11-14); in
 those versions neither probe started a model turn or spent anything from the limits.
 A snapshot is a plain JSON-serializable dict:
 {executor, source: live|turn|none, observed_at, windows: [{name, used_percent,
-resets_at, resets_text, status}], plan, notes, error}.
+resets_at, resets_text, status, observed_at}], plan, notes, error}. The store merges
+windows by name, so each window keeps the time it was last observed.
 """
 import asyncio
 from contextlib import contextmanager, suppress
@@ -28,7 +29,7 @@ CLAUDE_LINE = re.compile(r'^Current (?P<name>.+?):\s*(?P<pct>\d+(?:\.\d+)?)% use
 RESET_TEXT = re.compile(r'^(?:(?P<month>[A-Za-z]{3})[a-z]*\.? (?P<day>\d{1,2}),?\s+)?(?P<hour>\d{1,2})'
                         r'(?::(?P<minute>\d{2}))?\s*(?P<half>[ap])\.?m\.?\s*\((?P<zone>[^()]+)\)$', re.I)
 MONTHS = ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec')
-CLAUDE_WINDOWS = {'five_hour': 'session (5 h)', 'seven_day': 'week'}
+CLAUDE_WINDOWS = {'five_hour': 'session', 'seven_day': 'week (all models)'}  # The live probe's names.
 
 
 class ProbeError(Exception):
@@ -36,13 +37,27 @@ class ProbeError(Exception):
 
 
 def snapshot(executor, source, observed_at, windows=(), plan=None, notes=None, error=None):
-    return {'executor': executor, 'source': source, 'observed_at': observed_at, 'windows': list(windows),
+    windows = [{**item, 'observed_at': item.get('observed_at') or observed_at} for item in windows]
+    return {'executor': executor, 'source': source, 'observed_at': observed_at, 'windows': windows,
             'plan': plan, 'notes': notes or {}, 'error': error}
 
 
-def window(name, used, resets_at=None, resets_text=None, status=None):
+def merge(old, new):
+    """Windows by name, the newer observation of each wins; absent ones are kept."""
+    windows = {item['name']: item for item in old['windows']}
+    for item in new['windows']:
+        if item['name'] not in windows or item['observed_at'] >= windows[item['name']]['observed_at']:
+            windows[item['name']] = item
+    newer, older = (new, old) if new['observed_at'] >= old['observed_at'] else (old, new)
+    return {**newer, 'windows': list(windows.values()), 'plan': newer.get('plan') or older.get('plan'),
+            'notes': newer.get('notes') or older.get('notes') or {}, 'error': None}
+
+
+def window(name, used, resets_at=None, resets_text=None, status=None, observed_at=None):
+    """`observed_at` defaults to the snapshot's time when the window joins a snapshot."""
     resets_at = int(resets_at) if isinstance(resets_at, (int, float)) and resets_at > 0 else None
-    return {'name': name, 'used_percent': used, 'resets_at': resets_at, 'resets_text': resets_text, 'status': status}
+    return {'name': name, 'used_percent': used, 'resets_at': resets_at, 'resets_text': resets_text, 'status': status,
+            **({'observed_at': observed_at} if observed_at else {})}
 
 
 def reset_epoch(text, now):
@@ -270,18 +285,23 @@ class UsageStore:
             return {}
         if not isinstance(data, dict):
             return {}
-        return {name: snap for name, snap in data.items() if name in EXECUTORS and isinstance(snap, dict)
+        # Files written before per-window times fall back to the snapshot's time.
+        return {name: {**snap, 'windows': [{**item, 'observed_at': item.get('observed_at') or snap['observed_at']}
+                                           for item in snap['windows'] if isinstance(item, dict) and 'name' in item]}
+                for name, snap in data.items() if name in EXECUTORS and isinstance(snap, dict)
                 and isinstance(snap.get('observed_at'), (int, float)) and isinstance(snap.get('windows'), list)}
 
     def update(self, snap):
-        """Keep the newest successful snapshot; an older observation never replaces a newer one."""
+        """Merge a successful snapshot; an older observation never replaces a newer window."""
         if snap.get('error') or not snap.get('windows'):
             return False
         with self._locked():
             data = self.load()
-            if snap['executor'] in data and data[snap['executor']]['observed_at'] > snap['observed_at']:
+            old = data.get(snap['executor'])
+            merged = merge(old, snap) if old else snap
+            if merged == old:
                 return False
-            data[snap['executor']] = snap
+            data[snap['executor']] = merged
             fd, temp = tempfile.mkstemp(prefix='.usage-', dir=self.path.parent)  # Mode 0600.
             try:
                 with os.fdopen(fd, 'w') as file:
@@ -375,6 +395,8 @@ def format_usage(snapshots, now):
                 text += f", resets {item['resets_text']}"
             if item.get('status') and item['status'] != 'allowed':
                 text += f" [{item['status']}]"
+            if item.get('observed_at') and snap['observed_at'] - item['observed_at'] > 60:
+                text += f" (as of {ago(now - item['observed_at'])})"
             lines.append(text)
         notes = snap.get('notes') or {}
         if notes.get('status') and notes['status'] != 'allowed':

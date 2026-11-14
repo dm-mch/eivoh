@@ -81,7 +81,7 @@ def test_claude_garbage_or_model_turn_is_a_failure(stdout, reason):
 
 def test_codex_result_parsing_without_private_ids():
     snap = usage.parse_codex(CODEX_RESULT, NOW)
-    assert snap['windows'] == [usage.window('week', 51, 1795010673)]
+    assert snap['windows'] == [usage.window('week', 51, 1795010673, observed_at=NOW)]
     assert snap['plan'] == 'prolite' and snap['notes'] == {'reset_credits': 3}
     assert 'secret' not in json.dumps(snap)
 
@@ -109,7 +109,7 @@ def test_observe_both_event_shapes_and_ignores_other_lines():
             'seven_day_overage_included': {'utilization': 1, 'resetsAt': 0, 'status': 'rejected'}}}}, NOW)
     assert claude['source'] == 'turn' and claude['notes'] == {'status': 'allowed_warning'}
     assert [(w['name'], w['used_percent'], w['resets_at'], w['status']) for w in claude['windows']] == [
-        ('session (5 h)', 45, 1794651000, 'allowed'), ('week', 12, 1795176000, 'allowed'),
+        ('session', 45, 1794651000, 'allowed'), ('week (all models)', 12, 1795176000, 'allowed'),
         ('seven_day_overage_included', 100, None, 'rejected')]
     codex = usage.observe({'method': 'account/rateLimits/updated', 'params': {'rateLimits': CODEX_RESULT['rateLimits']}}, NOW)
     assert codex['executor'] == 'codex' and codex['source'] == 'turn' and codex['windows'][0]['used_percent'] == 51
@@ -123,16 +123,56 @@ def test_store_keeps_newest_and_passive_older_does_not_overwrite_live(tmp_path):
     store = usage.UsageStore(tmp_path / 'state' / 'usage.json')
     live = usage.snapshot('claude', 'live', NOW, [usage.window('session', 46)])
     assert store.update(live)
-    older = usage.snapshot('claude', 'turn', NOW - 60, [usage.window('session (5 h)', 40)])
+    older = usage.snapshot('claude', 'turn', NOW - 60, [usage.window('session', 40)])
     assert not store.update(older)
     assert not store.update(usage.snapshot('claude', 'none', None, error='live probe failed: x'))
     assert store.load()['claude'] == live
-    newer = {**older, 'observed_at': NOW + 60}
+    newer = {**older, 'observed_at': NOW + 60, 'windows': [{**older['windows'][0], 'observed_at': NOW + 60}]}
     assert store.update(newer) and store.load()['claude'] == newer
     assert stat.S_IMODE(os.stat(store.path).st_mode) == 0o600
     assert [p.name for p in store.path.parent.iterdir() if p.name.startswith('.usage-')] == []
     store.path.write_text('{broken')
     assert store.load() == {}
+
+
+def test_turn_event_merges_windows_by_name_into_live_probe(tmp_path):
+    store = usage.UsageStore(tmp_path / 'usage.json')
+    live = usage.parse_claude(claude_result(), NOW)
+    live['notes'] = {'billing': 'subscription'}
+    store.update(live)
+    turn = usage.observe({'type': 'rate_limit_event', 'rate_limit_info': {'status': 'allowed', 'unifiedWindows': {
+        'five_hour': {'utilization': 0.5, 'resetsAt': 1794651000, 'status': 'allowed'},
+        'seven_day': {'utilization': 0.13, 'resetsAt': 1795176000, 'status': 'allowed'}}}}, NOW + 600)
+    assert store.update(turn)
+    merged = store.load()['claude']
+    assert merged['source'] == 'turn' and merged['observed_at'] == NOW + 600
+    assert merged['notes'] == {'status': 'allowed'}
+    assert [(w['name'], w['used_percent'], w['observed_at']) for w in merged['windows']] == [
+        ('session', 50, NOW + 600), ('week (all models)', 13, NOW + 600), ('week (Fable)', 19, NOW)]
+    # A per-window observation older than the stored one never wins, even in a newer snapshot.
+    late = usage.snapshot('claude', 'turn', NOW + 700, [usage.window('session', 1, observed_at=NOW + 300),
+                                                         usage.window('week (Fable)', 20)])
+    assert store.update(late)
+    merged = store.load()['claude']
+    assert [(w['name'], w['used_percent']) for w in merged['windows']] == [
+        ('session', 50), ('week (all models)', 13), ('week (Fable)', 20)]
+    assert merged['observed_at'] == NOW + 700 and merged['notes'] == {'status': 'allowed'}
+    # Plan comes from the newest snapshot that has one.
+    store.update(usage.parse_codex(CODEX_RESULT, NOW))
+    store.update(usage.snapshot('codex', 'turn', NOW + 60, [usage.window('week', 52, 1795010673)]))
+    codex = store.load()['codex']
+    assert codex['plan'] == 'prolite' and codex['windows'][0]['used_percent'] == 52
+
+
+def test_old_store_without_window_times_still_loads(tmp_path):
+    path = tmp_path / 'usage.json'
+    path.write_text(json.dumps({'claude': {'executor': 'claude', 'source': 'live', 'observed_at': NOW,
+        'windows': [{'name': 'session', 'used_percent': 46, 'resets_at': None, 'resets_text': None, 'status': None}],
+        'plan': None, 'notes': {}, 'error': None}}))
+    store = usage.UsageStore(path)
+    assert store.load()['claude']['windows'][0]['observed_at'] == NOW
+    assert store.update(usage.snapshot('claude', 'turn', NOW + 5, [usage.window('week (all models)', 12)]))
+    assert [w['observed_at'] for w in store.load()['claude']['windows']] == [NOW, NOW + 5]
 
 
 def test_format_live_stale_and_unknown_without_tables():
@@ -154,6 +194,12 @@ def test_format_live_stale_and_unknown_without_tables():
                     'Codex: unknown (live probe failed: cannot start codex).')
     passed = usage.snapshot('claude', 'turn', NOW - 90000, [usage.window('week', 100, NOW - 10, status='rejected')])
     assert 'reset time has passed, data is outdated [rejected]' in usage.format_usage([passed], NOW)
+    mixed = usage.snapshot('claude', 'turn', NOW - 120, [usage.window('session', 50),
+                           usage.window('week (Fable)', 19, observed_at=NOW - 7200),
+                           usage.window('week (all models)', 13, observed_at=NOW - 150)])
+    lines = usage.format_usage([mixed], NOW).splitlines()
+    assert lines == ['Claude: last seen in a turn 2 min ago', 'session: 50% left (50% used)',
+                     'week (Fable): 81% left (19% used) (as of 2 h ago)', 'week (all models): 87% left (13% used)']
 
 
 def script(tmp_path, name, body):
