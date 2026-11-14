@@ -216,10 +216,11 @@ async def test_watch_cleans_pipe_holder_after_supervisor_death():
     proc = await asyncio.create_subprocess_exec(sys.executable, '-c', script, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE, start_new_session=True)
     tree = ProcessTree(proc)
-    tree.known[proc.pid] = process_table()[proc.pid][1]
-    child = int(await asyncio.wait_for(proc.stdout.readline(), 5))
-    watch = asyncio.create_task(tree.watch(interval=0.02))
+    child, watch = None, None
     try:
+        tree.known[proc.pid] = process_table()[proc.pid][1]
+        child = int(await asyncio.wait_for(proc.stdout.readline(), 5))
+        watch = asyncio.create_task(tree.watch(interval=0.02))
         await asyncio.sleep(0.1)
         assert child in tree.known
         proc.send_signal(signal.SIGKILL)
@@ -227,8 +228,12 @@ async def test_watch_cleans_pipe_holder_after_supervisor_death():
         table = process_table()
         assert child not in table or table[child][2] == 'Z'
     finally:
-        watch.cancel()
-        try:
-            os.kill(child, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if watch is not None:
+            watch.cancel()
+        for pid in (proc.pid, child):
+            try:
+                if pid is not None:
+                    os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await proc.wait()
