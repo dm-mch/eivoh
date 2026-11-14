@@ -1,6 +1,6 @@
 # Eivoh development plan
 
-Current stage: V3. V0, V1 and V2 are done (2026-11-13). No dates are set. The architecture describes the target system; this file describes the order in which it appears and is the only place where the current stage is stated.
+Current stage: V3, part V3.2. V0, V1 and V2 are done (2026-11-13); V3.1 is done (2026-11-14). No dates are set. The architecture describes the target system; this file describes the order in which it appears and is the only place where the current stage is stated.
 
 # How the plan works
 
@@ -87,7 +87,7 @@ Follow-up after V2:
 
 # V3. Working folder, memory and reflection
 
-State: V3.1 is built and tested offline but not deployed or accepted, see its section; V3.2 and V3.3 have not started. On the installed service executors currently write experience records and consult the private index under project instructions. All tasks share one working directory, which is the Eivoh core checkout with the private repository nested in it. Automatic per-task records, context selection and background reflection are not implemented in the gateway.
+State: V3.1 is done (2026-11-14), see its section; V3.2 is next; V3.2 and V3.3 have not started. Executors write experience records and consult the index under the instructions of the home. New tasks share one working directory, the home. Automatic per-task records, context selection and background reflection are not implemented in the gateway.
 
 Goal: the agent has a home of its own, experience is recorded there and reaches later tasks without reminders, and it is processed in the background.
 
@@ -95,7 +95,7 @@ The stage has three parts: V3.1, V3.2 and V3.3. They are designed together and b
 
 ## V3.1. Working folder separate from the project
 
-State: built and tested offline (2026-11-14); not deployed, and no "Done when" condition has been observed. The decisions below were settled with the owner on 2026-11-14 after a reuse review and probes of the installed CLIs; [issue #16](https://github.com/dm-mch/eivoh/issues/16) holds the options that were considered.
+State: done (2026-11-14). Built and deployed on the installed service; observed once there: the private repository moved to the home with a link left in the core; the release seeded the home's `AGENTS.md` and recorded the template commit, leaving the existing map and index alone; the database migrated to schema 9 with every earlier task keeping the old directory; a task opened before the change resumed its native session there; a new task ran in the home and read the `AGENTS.md` of the project it was asked about, which was the Eivoh core. Later tasks running in the home worked on a project other than the core, kept a note about it in the home and wrote experience records there. The decisions below were settled with the owner on 2026-11-14 after a reuse review and probes of the installed CLIs; [issue #16](https://github.com/dm-mch/eivoh/issues/16) holds the options that were considered.
 
 Goal: the agent's instructions and memory live in its own home, and a task can work on any project without losing them.
 
@@ -115,7 +115,7 @@ Build:
 * Move the private repository to the home; add seeding and the template-change notice to the deployment script.
 * A working folder fixed per task when the task is created. An executor session is bound to its directory, so existing tasks keep the current directory and still resume; new tasks get the home.
 
-Built, verified by offline tests only: schema version 9 stores the task's working folder; new tasks get the home, earlier tasks are backfilled with `EIVOH_WORKDIR`, and the service refuses to start when such tasks exist and the variable is unset; executors take the folder per run, and a missing folder fails the turn visibly; `python -m eivoh.home seed`, called by `deploy/release.sh` after validation, adds missing files, records the commit on the first seeding and afterwards only reports template changes; `AGENTS.md` is split into the home template and the project file. Remaining: moving the private repository of the installed service to the home and observing the "Done when" conditions in real use. Observed once in live probes through the gateway with a local channel and the seeded templates (Claude haiku and Codex gpt-6-luna): a task created before the change resumed its native session in the old directory; a new task ran in the home, read the `AGENTS.md` of a project outside it and followed the convention written there. In earlier runs the smaller models skipped the project's file until the rule became a section of its own in the template, and gpt-6-luna skipped it once after that, so this rule is not reliable on small models. Unverified: a real release and rollback, and a start refused by systemd without a restart loop.
+Built, verified by offline tests only: schema version 9 stores the task's working folder; new tasks get the home, earlier tasks are backfilled with `EIVOH_WORKDIR`, and the service refuses to start when such tasks exist and the variable is unset; executors take the folder per run, and a missing folder fails the turn visibly; `python -m eivoh.home seed`, called by `deploy/release.sh` after validation, adds missing files, records the commit on the first seeding and afterwards only reports template changes; `AGENTS.md` is split into the home template and the project file. Observed once in live probes through the gateway with a local channel and the seeded templates (Claude haiku and Codex gpt-6-luna): a task created before the change resumed its native session in the old directory; a new task ran in the home, read the `AGENTS.md` of a project outside it and followed the convention written there. In earlier runs the smaller models skipped the project's file until the rule became a section of its own in the template, and gpt-6-luna skipped it once after that, so this rule is not reliable on small models. Unverified: a rollback, and a start refused by systemd without a restart loop.
 
 Confirmed by probes (Claude Code 2.1.323 and codex-cli 0.167.2, small models, one run per case):
 
@@ -130,6 +130,8 @@ Known limitations: commands run in the home unless the agent changes directory, 
 For the later parts: the home is where V3.2 writes records and V3.3 writes notes. Its layout separates raw records, the index, topical notes, skills and the processing state, which is not versioned.
 
 Done when: a task works on a project other than the Eivoh core with the agent's instructions and memory available; tasks opened before the change still resume; experience records are written to the home.
+
+Done (2026-11-14): closed by the owner after live use. Each condition was observed on the installed service: a task running in the home worked on another project, wrote the note about that project and an experience record with its index line into the home; a second task in the home wrote a skill and its record there; tasks opened before the change kept resuming in the old directory. Carried forward as unverified, to check when ordinary work exercises them: reading the instruction file of a project other than the core (the observed project has none), reliability of that rule on small models, a rollback, and a start refused by systemd without a restart loop. The `private` link in the core stays until the tasks opened before the move are closed.
 
 ## V3.2. Memory and reading it for a task
 
