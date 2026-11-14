@@ -1,4 +1,5 @@
 import asyncio
+import os
 import json
 from pathlib import Path
 
@@ -200,3 +201,34 @@ async def test_turn_model_overrides_default_on_start_and_resume(rig):
     assert logs[1]['resume'] == sid
     assert executor.model == 'configured-default'
     assert executor.command(None)[-2:] == ['--model', 'configured-default']
+
+
+async def test_watch_cleans_pipe_holder_after_supervisor_death():
+    # Process.wait() also waits for pipes; a killed supervisor whose tracked
+    # setsid child holds stdout must still end the watch and the child.
+    import signal
+    import sys
+    from eivoh.executors.cli import ProcessTree
+    script = ("import os, subprocess, sys, time\n"
+              "child = subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+              "print(child.pid, flush=True)\n"
+              "time.sleep(60)\n")
+    proc = await asyncio.create_subprocess_exec(sys.executable, '-c', script, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE, start_new_session=True)
+    tree = ProcessTree(proc)
+    tree.known[proc.pid] = process_table()[proc.pid][1]
+    child = int(await asyncio.wait_for(proc.stdout.readline(), 5))
+    watch = asyncio.create_task(tree.watch(interval=0.02))
+    try:
+        await asyncio.sleep(0.1)
+        assert child in tree.known
+        proc.send_signal(signal.SIGKILL)
+        await asyncio.wait_for(watch, 5)
+        table = process_table()
+        assert child not in table or table[child][2] == 'Z'
+    finally:
+        watch.cancel()
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
