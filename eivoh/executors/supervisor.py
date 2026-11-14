@@ -7,7 +7,6 @@ still requires systemd's cgroup cleanup.
 """
 import ctypes
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -21,12 +20,19 @@ def enable_subreaper():
 
 def children():
     # Every direct child is ours, including children adopted between scans.
-    result = []
-    for path in Path('/proc').glob('[0-9]*/stat'):
+    # Raw descriptors instead of pathlib glob: the scan repeats until ECHILD.
+    result, me = [], os.getpid()
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit():
+            continue
         try:
-            fields = path.read_text().rsplit(')', 1)[1].split()
-            if int(fields[1]) == os.getpid():
-                result.append(int(path.parent.name))
+            fd = os.open(f'/proc/{entry.name}/stat', os.O_RDONLY)
+            try:
+                data = os.read(fd, 4096)
+            finally:
+                os.close(fd)
+            if int(data[data.rindex(b')') + 1:].split()[1]) == me:
+                result.append(int(entry.name))
         except (OSError, ValueError, IndexError):
             continue
     return result
