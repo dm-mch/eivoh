@@ -223,7 +223,7 @@ def test_observe_skips_when_the_store_is_locked(tmp_path):
         fcntl.flock(holder, fcntl.LOCK_EX)
         started = time.monotonic()
         assert service.observe({**event, 'params': {'rateLimits': {**CODEX_RESULT['rateLimits'], 'planType': 'pro'}}})
-        assert time.monotonic() - started < 0.5
+        assert time.monotonic() - started < 0.05
         with pytest.raises(usage.StoreBusy):
             service.store.update(usage.parse_codex(CODEX_RESULT, time.time()), lock_timeout=0.05)
     finally:

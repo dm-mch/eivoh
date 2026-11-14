@@ -274,7 +274,7 @@ observation of a window replaces the older one, and windows a turn event does no
 report (such as Claude's per-model week) keep their last value, shown with
 “(as of 2 h ago)” when older than the rest. Restrictions and notes come only from
 the newest result. A turn never waits for the store: if another process holds its
-lock, that observation is skipped. When a probe fails, `/usage` shows the stored data with its
+lock, that observation is skipped at once. When a probe fails, `/usage` shows the stored data with its
 age and source (for example “last seen in a turn 2 h ago”) and the probe error;
 with nothing stored the executor is “unknown”. Reset times are shown as time left
 when the provider gives an exact time; Claude's text is converted using its time

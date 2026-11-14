@@ -317,7 +317,10 @@ class UsageStore:
 
     @contextmanager
     def _locked(self, timeout):
-        """Bounded wait: another process (the CLI) may hold the lock or be suspended."""
+        """Bounded wait: another process (the CLI) may hold the lock or be suspended.
+
+        timeout=0 is a single non-blocking attempt, with no sleep.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(self.path.with_name(self.path.name + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -380,17 +383,17 @@ class UsageService:
         self.claude_bin, self.codex_bin, self.timeout = claude_bin, codex_bin, timeout
 
     def observe(self, payload):
-        """Called on the event loop for every turn line: cheap, and never waits long.
+        """Called on the event loop for every turn line: cheap, and never sleeps.
 
         Writes the store only for a rate-limit event; under lock contention the
-        observation is skipped (the next one or a live probe replaces it).
+        observation is skipped at once (the next one or a live probe replaces it).
         """
         snap = observe(payload)
         if snap is not None:
             try:
-                self.store.update(snap, lock_timeout=0.15)
+                self.store.update(snap, lock_timeout=0)
             except StoreBusy as exc:
-                log.warning('Usage observation skipped: %s', exc)
+                log.debug('Usage observation skipped: %s', exc)
         return snap
 
     async def snapshot(self, live=True):
