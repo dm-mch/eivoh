@@ -268,8 +268,31 @@ preparations may run at once, with a 180-second deadline; a pending file is a FI
 barrier for later input to that task. Commands remain usable during preparation.
 As with queued text, `/model` can change the executor selected before launch;
 prepared input can steer an eligible running turn without changing that turn's
-output directory. `/stop` cancels preparation and prevents a late result from
+output directory. If the selected model or effort differs from the still-running
+turn when preparation completes, a durable queue notice is issued once; it is
+omitted if the turn has ended or the settings match again. `/stop` cancels preparation and prevents a late result from
 starting work. Restart uses the saved descriptors and existing completed downloads.
+
+Rich messages flatten to plain text in document order, with numbered placeholders
+at each media position and the same attachment manifest and limits. Nested media,
+captions and credits are retained. Rich messages with media treat all their text
+as content; text-only rich messages use exactly the ordinary text command rules
+(including the first slash token). Only fully flattened text/structure blocks and
+the supported media blocks are accepted; unsupported rich blocks fail visibly,
+including maps, button rows and unknown/future block types, even when nested.
+They retain named failure descriptors, so a caption such as `/stop` remains content.
+Unknown inline RichText types keep their plain `text` when present; inline types
+without a text representation also fail visibly. This replaces the earlier
+skip-unknown-block behavior. Malformed content and rich parse failures use the
+same durable unsupported-message notice; recognized media blocks remain content
+even when their descriptors are broken. Rich traversal allows 128 JSON levels
+(with margin over the API's 16 block levels) and 4096 blocks, with no node cap;
+validation uses an iterative traversal. python-telegram-bot 22.8 supports
+Bot API 10.0, while rich messages arrived in Bot API 10.1+: the channel reads
+`api_kwargs['rich_message']` and also accepts a future `message.rich_message` object
+through `to_dict()`. This fix is verified offline against the documented schema;
+a real rich message in Telegram and the Android client's exact block sequence
+remain unverified.
 
 Downloads are streamed with a hard 20 MB byte limit, a 90-second download deadline,
 and at most ten files per message. Files live under `EIVOH_STATE_DIR/files/inputs/`,
@@ -308,8 +331,14 @@ back to its task for reply routing. A filesystem path by itself, a file elsewher
 or an unselected file in the output directory is never uploaded automatically.
 Unsupported Telegram media types, including video/sticker messages, receive an
 explicit notice; their captions stay in the inbound journal. Send them as documents
-to make their bytes available to the executor. Snapshot copying, upload hashing
-and voice-file reads run off the event loop. Cancellation may leave a bounded local
+to make their bytes available to the executor. Other unsupported owner content
+(such as locations, polls, contacts or unknown API fields) receives a durable
+failure notice naming the content fields. An explicit list of installed PTB
+service fields keeps chat administration, payment/gift and state-change events
+silent; invoices, shared users/chats and Web App data are user content and receive
+notices. Unhandled owner updates, including silent service drops, log their update
+ID and non-empty field/API key names at WARNING, without content values.
+Snapshot copying, upload hashing and voice-file reads run off the event loop. Cancellation may leave a bounded local
 copy/read finishing in the background, but it cannot publish a stopped task's output.
 Telegram's cloud limits are documented in its [file API](https://core.telegram.org/bots/api#getfile),
 [photo API](https://core.telegram.org/bots/api#sendphoto) and
