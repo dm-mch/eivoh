@@ -36,7 +36,8 @@ class Config:
     telegram_token: str
     owner_id: int
     state_dir: Path
-    workdir: Path
+    workdir: Path | None  # Working directory of tasks created before V3.1; None if unset.
+    home: Path  # The agent's home: working directory of every new task.
     claude_model: str | None = None
     permission_mode: str = "bypassPermissions"
     claude_bin: str = "claude"
@@ -54,11 +55,14 @@ class Config:
         owner = os.environ.get("EIVOH_OWNER_ID", "")
         if not token or not owner.isdecimal() or int(owner) <= 0:
             raise ValueError("EIVOH_TELEGRAM_TOKEN and a positive numeric EIVOH_OWNER_ID are required")
-        if not os.environ.get("EIVOH_WORKDIR", "").strip():
-            raise ValueError("EIVOH_WORKDIR must be set explicitly")
-        workdir = Path(os.environ["EIVOH_WORKDIR"]).expanduser().resolve()
-        if not workdir.is_dir():
-            raise ValueError("EIVOH_WORKDIR must be an existing directory")
+        home = Path(os.environ.get("EIVOH_HOME", "").strip() or "~/eivoh-home").expanduser().resolve()
+        if not home.is_dir():
+            raise ValueError(f"EIVOH_HOME {home} does not exist; deployment (deploy/release.sh) seeds it")
+        workdir = None
+        if os.environ.get("EIVOH_WORKDIR", "").strip():
+            workdir = Path(os.environ["EIVOH_WORKDIR"]).expanduser().resolve()
+            if not workdir.is_dir():
+                raise ValueError("EIVOH_WORKDIR must be an existing directory")
         mode = os.environ.get("EIVOH_CLAUDE_PERMISSION_MODE", "bypassPermissions")
         if mode not in {"acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}:
             raise ValueError("Unknown EIVOH_CLAUDE_PERMISSION_MODE")
@@ -83,7 +87,7 @@ class Config:
             raise ValueError("EIVOH_MAX_PARALLEL must be an integer >= 1")
         return cls(token, int(owner),
                    Path(os.environ.get("EIVOH_STATE_DIR", "~/.local/state/eivoh")).expanduser().resolve(),
-                   workdir, os.environ.get("EIVOH_CLAUDE_MODEL") or None,
+                   workdir, home, os.environ.get("EIVOH_CLAUDE_MODEL") or None,
                    mode, os.environ.get("EIVOH_CLAUDE_BIN", "claude"), claude_args,
                    provider_from_env(os.environ), default_executor,
                    os.environ.get("EIVOH_CODEX_BIN", "codex"), os.environ.get("EIVOH_CODEX_MODEL") or None, codex_args, int(parallel))

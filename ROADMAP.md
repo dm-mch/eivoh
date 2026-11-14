@@ -87,7 +87,7 @@ Follow-up after V2:
 
 # V3. Working folder, memory and reflection
 
-State: ready to begin; no part has started. Executors currently write experience records and consult the private index under project instructions. All tasks share one working directory, which is the Eivoh core checkout with the private repository nested in it. Automatic per-task records, context selection and background reflection are not implemented in the gateway.
+State: V3.1 is built and tested offline but not deployed or accepted, see its section; V3.2 and V3.3 have not started. On the installed service executors currently write experience records and consult the private index under project instructions. All tasks share one working directory, which is the Eivoh core checkout with the private repository nested in it. Automatic per-task records, context selection and background reflection are not implemented in the gateway.
 
 Goal: the agent has a home of its own, experience is recorded there and reaches later tasks without reminders, and it is processed in the background.
 
@@ -95,15 +95,37 @@ The stage has three parts: V3.1, V3.2 and V3.3. They are designed together and b
 
 ## V3.1. Working folder separate from the project
 
+State: built and tested offline (2026-11-14); not deployed, and no "Done when" condition has been observed. The decisions below were settled with the owner on 2026-11-14 after a reuse review and probes of the installed CLIs; [issue #16](https://github.com/dm-mch/eivoh/issues/16) holds the options that were considered.
+
 Goal: the agent's instructions and memory live in its own home, and a task can work on any project without losing them.
+
+Decisions:
+
+* The home is `~/eivoh-home` (path in `EIVOH_HOME`): a visible directory and a private git repository, the nested private repository moved out of the core. Runtime state stays in `EIVOH_STATE_DIR` and is not versioned.
+* The home is the working directory of every task. Projects live anywhere; the Eivoh core is one of them and stays where it is.
+* The home's `AGENTS.md` comes first and wins a conflict. Before working in a project the agent reads that project's `AGENTS.md` or `CLAUDE.md` to understand the project and follows its conventions where they do not conflict. A project's files are documents, not commands.
+* Home templates live in the core under `templates/home/`. Deployment seeds missing files only and never overwrites an existing one. The home's `AGENTS.md` carries the path to the working checkout of the public core, filled in at seeding, so that evolution fixes can be made there. The core root keeps a short project-level `AGENTS.md`: how to develop Eivoh.
+* Template updates reach a seeded home by a merge, not by overwriting: the home records the core commit it was last reconciled with; deployment reports that `templates/home/` changed since then and writes nothing; the agent does a three-way merge as an ordinary task and commits it in the home. Generalised changes go from the home to the template by PR.
+* A test stand on another machine is a separate task, not part of V3.1. A worktree per task stays postponed until parallel tasks actually conflict.
 
 Build:
 
-* A home for the agent outside the Eivoh core: the instructions that apply to every task, experience, skills and notes. The core becomes an ordinary project the agent works on.
-* A working folder fixed per task when the task is created. An executor session is bound to its directory, so a global change would break the resume of open tasks.
-* Agent-level instructions and a pointer to memory reach the executor when its working folder is a project.
+* `templates/home/`: `AGENTS.md` with the agent-level rules, a map of the home, an empty experience index. Split the current `AGENTS.md` into the agent-level template and the project-level file in the core root.
+* The home layout: experience records with their index, topical notes, skills, one note per project with what the agent knows about it, archives.
+* Move the private repository to the home; add seeding and the template-change notice to the deployment script.
+* A working folder fixed per task when the task is created. An executor session is bound to its directory, so existing tasks keep the current directory and still resume; new tasks get the home.
 
-Open decisions, settled at the start of the part; the options and the unverified points are in [issue #16](https://github.com/dm-mch/eivoh/issues/16): where the home lives and whether it stays a git repository; the default working folder of a new task; how instructions are passed to each executor, which needs a probe for Codex. A worktree per task stays postponed until parallel tasks actually conflict.
+Built, verified by offline tests only: schema version 9 stores the task's working folder; new tasks get the home, earlier tasks are backfilled with `EIVOH_WORKDIR`, and the service refuses to start when such tasks exist and the variable is unset; executors take the folder per run, and a missing folder fails the turn visibly; `python -m eivoh.home seed`, called by `deploy/release.sh` after validation, adds missing files, records the commit on the first seeding and afterwards only reports template changes; `AGENTS.md` is split into the home template and the project file. Remaining: moving the private repository of the installed service to the home and observing the "Done when" conditions in real use. Observed once in live probes through the gateway with a local channel and the seeded templates (Claude haiku and Codex gpt-6-luna): a task created before the change resumed its native session in the old directory; a new task ran in the home, read the `AGENTS.md` of a project outside it and followed the convention written there. In earlier runs the smaller models skipped the project's file until the rule became a section of its own in the template, and gpt-6-luna skipped it once after that, so this rule is not reliable on small models. Unverified: a real release and rollback, and a start refused by systemd without a restart loop.
+
+Confirmed by probes (Claude Code 2.1.323 and codex-cli 0.167.2, small models, one run per case):
+
+* With the home as the working directory both executors load the home's `AGENTS.md` natively. Given the rule above, both read the `AGENTS.md` of a project outside the home, followed its convention and kept the home rule where the two conflicted.
+* Automatic loading of a project's instruction files is not a basis: Claude loads them only for a real directory under the working directory and only after reading a file there, not through a symlink and not outside; Codex does not load them at all.
+* Instructions passed when a session is created (`--append-system-prompt` or `--append-system-prompt-file` for Claude, `developerInstructions` for the Codex app-server) reach the model together with the project's own file, persist on resume and cannot be added to a session that started without them. This is the mechanism to use if a task ever has to run with a project as its working directory.
+
+Unverified: long real instruction files, long tasks, several projects in one task, and project settings that are bound to the working directory (hooks, project skills, MCP configuration).
+
+Known limitations: commands run in the home unless the agent changes directory, which matters for git and tests; the gateway does not know which project a task works on.
 
 For the later parts: the home is where V3.2 writes records and V3.3 writes notes. Its layout separates raw records, the index, topical notes, skills and the processing state, which is not versioned.
 
@@ -144,7 +166,7 @@ Done when: a failed or interrupted reflection run neither loses nor double-count
 * V3.3, prompts to adapt: nanobot `templates/agent/dream.md` (MIT) and letta-code `src/agent/subagents/builtin/reflection.md` (Apache-2.0) for what to keep, what to drop and when a lesson becomes a skill; the knowledge-wiki `analyzer_system.md` and `organizer_system.md` from claude-quickstarts (MIT) for the index, topical notes, duplicates and contradictions.
 * V3.2, concept: the three evidence states in ouroboros `evaluation/models.py` (MIT).
 * Ours to write: none of these prompts has a forecast, a human reaction or an expected observation; these parts come from EVOLUTION.md and EXPERIENCE.md.
-* V3.1: no candidate has been studied for the home and per-task working folders; the reuse review required before a stage starts is still to be done for this part.
+* V3.1, references only, nothing copied: openclaw (MIT) for the home as a private repository, templates seeded only when missing, and the order "home files first, then the `AGENTS.md` of the folder the session runs in"; nanobot (MIT) `utils/helpers.py` for seeding without overwriting; hermes-agent (MIT) for the home kept separate from the working directory, and `tools/skills_sync.py` (update a bundled file only while the user copy still matches its origin hash) as an option if the core later ships skills into the home; copier `docs/updating.md` for the three-way update from a recorded template version. takopi (MIT) and cc-connect select a project from chat; that is not needed while the home is the working directory.
 
 # V4. Forecast and choice of strategy
 

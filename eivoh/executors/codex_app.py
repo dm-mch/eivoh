@@ -28,7 +28,7 @@ class CodexAppExecutor(InteractiveExecutor, CodexExecutor):
         await self.rpc(run, 'initialize', {'clientInfo': {'name': 'eivoh', 'version': '0.1.0'},
                                           'capabilities': {'experimentalApi': True}})
         await run.write({'method': 'initialized'})
-        params = {'cwd': str(self.workdir), 'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}
+        params = {'cwd': str(run.cwd or self.workdir), 'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}
         if model or self.model:
             params['model'] = model or self.model
         if run.session_id:

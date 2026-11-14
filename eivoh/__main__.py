@@ -12,7 +12,7 @@ from .executors.claude import ClaudeStreamExecutor
 from .executors.codex_app import CodexAppExecutor
 from .gateway import Gateway
 from .speech import make_transcriber
-from .storage import Storage
+from .storage import LegacyWorkdirRequired, Storage
 from .titles import ClaudeTitleExecutor, CodexTitleExecutor
 
 
@@ -25,11 +25,13 @@ async def serve(config: Config):
 
 async def _serve_locked(config: Config):
     os.umask(0o077)
-    storage = Storage(config.state_dir / "eivoh.sqlite3", config.default_executor)
+    # New tasks work in the home; tasks created before V3.1 keep the old folder.
+    storage = Storage(config.state_dir / "eivoh.sqlite3", config.default_executor,
+                      task_workdir=config.home, legacy_workdir=config.workdir)
     executors = {
-        "claude": ClaudeStreamExecutor(config.workdir, config.claude_bin, config.claude_model,
+        "claude": ClaudeStreamExecutor(config.home, config.claude_bin, config.claude_model,
                                  config.permission_mode, extra_args=config.claude_args),
-        "codex": CodexAppExecutor(config.workdir, config.codex_bin, config.codex_model,
+        "codex": CodexAppExecutor(config.home, config.codex_bin, config.codex_model,
                                extra_args=config.codex_args),
     }
     executor = executors.pop(config.default_executor)
@@ -80,9 +82,15 @@ def main():
     # HTTP URLs contain the bot token. Never log request URLs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # 78 (RestartPreventExitStatus in the unit): configuration errors, which a restart cannot fix.
     try:
-        asyncio.run(serve(Config.from_env()))
-    except ConsumerConflict as exc:
+        config = Config.from_env()
+    except ValueError as exc:
+        logging.getLogger(__name__).error('Configuration error: %s', exc)
+        raise SystemExit(78) from None
+    try:
+        asyncio.run(serve(config))
+    except (ConsumerConflict, LegacyWorkdirRequired) as exc:
         logging.getLogger(__name__).error('%s', exc)
         raise SystemExit(78) from None
 

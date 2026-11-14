@@ -50,7 +50,7 @@ async def test_cli_start_resume_journal_effort(rig):
 async def test_codex_turn_request_effort_and_model(tmp_path, session, effort):
     executor = CodexAppExecutor(tmp_path, model='configured-model')
     executor.rpc = AsyncMock(side_effect=[{}, {'thread': {'id': session or 'new-thread'}}, {'turn': {'id': 'turn'}}])
-    run = SimpleNamespace(session_id=session, write=AsyncMock(), ready=SimpleNamespace(set=lambda: None))
+    run = SimpleNamespace(session_id=session, cwd=None, write=AsyncMock(), ready=SimpleNamespace(set=lambda: None))
     await executor.initialize(run, 'prompt', 'gpt-6.1-sol', effort)
     thread_call, turn_call = executor.rpc.call_args_list[1:]
     assert thread_call.args[1] == ('thread/resume' if session else 'thread/start')

@@ -3,13 +3,48 @@ import pytest
 from eivoh.config import Config
 
 
+@pytest.fixture(autouse=True)
+def home(monkeypatch, tmp_path):
+    # Never depend on the real ~/eivoh-home.
+    path = tmp_path / 'home'
+    path.mkdir()
+    monkeypatch.setenv('EIVOH_HOME', str(path))
+    return path
+
+
+def test_home_and_legacy_workdir(monkeypatch, tmp_path, home):
+    monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
+    monkeypatch.setenv('EIVOH_OWNER_ID', '123')
+    for value in (None, '', '  '):
+        if value is None:
+            monkeypatch.delenv('EIVOH_WORKDIR', raising=False)
+        else:
+            monkeypatch.setenv('EIVOH_WORKDIR', value)
+        config = Config.from_env()
+        assert config.home == home and config.workdir is None
+    monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
+    assert (Config.from_env().home, Config.from_env().workdir) == (home, tmp_path)
+    monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path / 'missing'))
+    with pytest.raises(ValueError, match='EIVOH_WORKDIR must be an existing directory'):
+        Config.from_env()
+    monkeypatch.delenv('EIVOH_WORKDIR')
+    monkeypatch.setenv('EIVOH_HOME', str(tmp_path / 'missing'))
+    with pytest.raises(ValueError, match='does not exist.*deploy/release.sh'):
+        Config.from_env()
+    # Default: ~/eivoh-home.
+    monkeypatch.delenv('EIVOH_HOME')
+    monkeypatch.setenv('HOME', str(tmp_path))
+    with pytest.raises(ValueError, match=f'EIVOH_HOME {tmp_path}/eivoh-home does not exist'):
+        Config.from_env()
+    (tmp_path / 'eivoh-home').mkdir()
+    assert Config.from_env().home == tmp_path / 'eivoh-home'
+
+
 def test_config(monkeypatch, tmp_path):
     for key in ('EIVOH_STT', 'SONIOX_API_KEY', 'EIVOH_STATE_DIR', 'EIVOH_WORKDIR', 'EIVOH_CLAUDE_MODEL', 'EIVOH_CLAUDE_PERMISSION_MODE', 'EIVOH_CLAUDE_BIN', 'EIVOH_CLAUDE_ARGS'):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
     monkeypatch.setenv('EIVOH_OWNER_ID', '123')
-    with pytest.raises(ValueError, match='EIVOH_WORKDIR must be set explicitly'):
-        Config.from_env()
     monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
     config = Config.from_env()
     assert config.owner_id == 123
@@ -151,3 +186,21 @@ def test_codex_app_server_option_missing_values(monkeypatch, tmp_path, value):
     monkeypatch.setenv('EIVOH_CODEX_ARGS', value)
     with pytest.raises(ValueError, match='requires'):
         Config.from_env()
+
+
+def test_startup_configuration_errors_exit_78(monkeypatch):
+    # RestartPreventExitStatus=78: systemd must not restart-loop on these.
+    import eivoh.__main__ as entry
+    from eivoh.storage import LegacyWorkdirRequired
+
+    monkeypatch.delenv('EIVOH_TELEGRAM_TOKEN', raising=False)
+    with pytest.raises(SystemExit) as exit_info:
+        entry.main()
+    assert exit_info.value.code == 78
+    monkeypatch.setattr(entry.Config, 'from_env', classmethod(lambda cls: object()))
+    async def serve(config):
+        raise LegacyWorkdirRequired('EIVOH_WORKDIR must be set')
+    monkeypatch.setattr(entry, 'serve', serve)
+    with pytest.raises(SystemExit) as exit_info:
+        entry.main()
+    assert exit_info.value.code == 78

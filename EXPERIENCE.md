@@ -58,7 +58,7 @@ Check: not verified.
 
 # Storage and privacy
 
-* This file describes the layout and the rules. Records are kept in the private repository private/, in the private/experience/ folder: one task, one file with the date in its name, with navigation through [private/experience/index.md](private/experience/index.md). Private archives are in private/archive/. Private and group contexts are not mixed.
+* This file describes the layout and the rules. Records are kept in the agent's home, a private repository outside the core (`EIVOH_HOME`, by default `~/eivoh-home`), in its `experience/` folder: one task, one file with the date in its name, with navigation through `experience/index.md` there. Private archives are in its `archive/` folder. Private and group contexts are not mixed.
 * Moving material into the public core and handling secrets follow the rules in [AGENTS.md](AGENTS.md). Retention periods, deletion and backups need a separate decision.
 
 # Candidates for borrowing
