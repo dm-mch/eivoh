@@ -85,27 +85,66 @@ Follow-up after V2:
 * Carry forward the unverified scenarios noted above, including Claude steering/files in Telegram, outgoing photos, file clarification during a running Telegram task, stop during transfer, and native session handoff recovery. Check them when relevant ordinary work exercises them; stage closure does not mark them tested.
 * File/journal retention and a command to retrieve retained results remain proposals to decide as needed. They are not implemented or added to V3's agreed scope.
 
-# V3. Experience and reflection
+# V3. Working folder, memory and reflection
 
-State: ready to begin. Executors currently write experience records and consult the private index under project instructions. Automatic per-task record creation, background reflection and context selection are not yet implemented in the gateway.
+State: ready to begin; no part has started. Executors currently write experience records and consult the private index under project instructions. All tasks share one working directory, which is the Eivoh core checkout with the private repository nested in it. Automatic per-task records, context selection and background reflection are not implemented in the gateway.
 
-Goal: experience is recorded and processed without reminders, and later tasks receive the relevant part of it.
+Goal: the agent has a home of its own, experience is recorded there and reaches later tasks without reminders, and it is processed in the background.
+
+The stage has three parts: V3.1, V3.2 and V3.3. They are designed together and built separately. The design of each part, starting with the first, takes the other two into account: the layout of the home and the format of a record are chosen with reading and reflection in mind. Each part has its own "Done when" and is accepted on its own, in this order.
+
+## V3.1. Working folder separate from the project
+
+Goal: the agent's instructions and memory live in its own home, and a task can work on any project without losing them.
+
+Build:
+
+* A home for the agent outside the Eivoh core: the instructions that apply to every task, experience, skills and notes. The core becomes an ordinary project the agent works on.
+* A working folder fixed per task when the task is created. An executor session is bound to its directory, so a global change would break the resume of open tasks.
+* Agent-level instructions and a pointer to memory reach the executor when its working folder is a project.
+
+Open decisions, settled at the start of the part; the options and the unverified points are in [issue #16](https://github.com/dm-mch/eivoh/issues/16): where the home lives and whether it stays a git repository; the default working folder of a new task; how instructions are passed to each executor, which needs a probe for Codex. A worktree per task stays postponed until parallel tasks actually conflict.
+
+For the later parts: the home is where V3.2 writes records and V3.3 writes notes. Its layout separates raw records, the index, topical notes, skills and the processing state, which is not versioned.
+
+Done when: a task works on a project other than the Eivoh core with the agent's instructions and memory available; tasks opened before the change still resume; experience records are written to the home.
+
+## V3.2. Memory and reading it for a task
+
+Goal: experience is recorded without reminders, and a new task receives the part of it that is relevant.
 
 Build:
 
 * An experience record created automatically for each task from its raw events, with the forecast made before the task and the owner's reaction in chat attached: accepted, asked for a redo, fixed it themselves, did not use it, or unknown.
 * Result status based on evidence: confirmed needs an observed fact, refuted needs an observed failure, everything else stays unverified.
-* Background reflection in batches: it processes new records, maintains the index and the topical notes, keeps a list of expectations from changes and checks them when a matching task appears.
+* An index entry added automatically for each record.
 * Selection of relevant experience into the context of a new task; skills loaded progressively: description first, body on demand.
 
-Reuse:
+Open decision: whether the separately stored current state described in EXPERIENCE.md (open tasks, statuses and circumstances, each with a source and the time it was last checked) is built in this part. It is not assigned to any stage yet.
 
-* Mechanism to re-implement: nanobot `agent/memory.py` (MIT), where the processing position moves forward only after a clean run and unprocessed entries are never compacted away. Add a status per record, because a single position does not prevent double processing after a retry; keep the processing state out of the versioned notes.
-* Prompts to adapt: nanobot `templates/agent/dream.md` (MIT) and letta-code `src/agent/subagents/builtin/reflection.md` (Apache-2.0) for what to keep, what to drop and when a lesson becomes a skill; the knowledge-wiki `analyzer_system.md` and `organizer_system.md` from claude-quickstarts (MIT) for the index, topical notes, duplicates and contradictions.
-* Concept: the three evidence states in ouroboros `evaluation/models.py` (MIT).
+For V3.3: a record carries what reflection needs (forecast, reaction, evidence status, expected observation) and has a processing status that is kept out of the versioned notes.
+
+Done when: records appear without a reminder; a task visibly uses a lesson from an earlier record.
+
+## V3.3. Reflection
+
+Goal: memory is processed and reorganised in the background.
+
+Build:
+
+* Background reflection in batches: it processes new records and maintains the index and the topical notes, including duplicates and contradictions.
+* A list of expectations from changes, checked when a matching task appears.
+* Lessons are turned into skills; when a lesson qualifies is decided with the prompts adapted for this part.
+
+Done when: a failed or interrupted reflection run neither loses nor double-counts records; at least one expectation from a change is closed as confirmed or refuted.
+
+## Reuse
+
+* V3.2 and V3.3, mechanism to re-implement: nanobot `agent/memory.py` (MIT), where the processing position moves forward only after a clean run and unprocessed entries are never compacted away. Add a status per record, because a single position does not prevent double processing after a retry; keep the processing state out of the versioned notes.
+* V3.3, prompts to adapt: nanobot `templates/agent/dream.md` (MIT) and letta-code `src/agent/subagents/builtin/reflection.md` (Apache-2.0) for what to keep, what to drop and when a lesson becomes a skill; the knowledge-wiki `analyzer_system.md` and `organizer_system.md` from claude-quickstarts (MIT) for the index, topical notes, duplicates and contradictions.
+* V3.2, concept: the three evidence states in ouroboros `evaluation/models.py` (MIT).
 * Ours to write: none of these prompts has a forecast, a human reaction or an expected observation; these parts come from EVOLUTION.md and EXPERIENCE.md.
-
-Done when: records appear without a reminder; a failed or interrupted reflection run neither loses nor double-counts records; at least one expectation from a change is closed as confirmed or refuted; a task visibly uses a lesson from an earlier record.
+* V3.1: no candidate has been studied for the home and per-task working folders; the reuse review required before a stage starts is still to be done for this part.
 
 # V4. Forecast and choice of strategy
 
