@@ -254,7 +254,8 @@ the answer follows from a background check (lost, not replayed, if the service
 stops first). Two sources feed it:
 
 * Live probes, run in parallel in an empty temporary directory with a 20-second
-  limit each, without API keys in the environment. Claude: `/usage` sent on stdin
+  limit each, without API keys in the environment, under the same subreaper as
+  turns, so no descendant outlives a probe. Claude: `/usage` sent on stdin
   to `claude -p --output-format json --no-session-persistence --safe-mode` with
   tools and MCP disabled; only lines of the form `Current <window>: N% used · resets
   <time>` are used, and an answer that reports an error, a turn or a cost counts as a
@@ -267,10 +268,13 @@ stops first). Two sources feed it:
 * Rate-limit events that ordinary turns already stream (Claude `rate_limit_event`,
   Codex `account/rateLimits/updated`), noted as the turn runs.
 
-Results are kept in `usage.json` in the state directory (mode 0600), merged by
-window name: a newer observation of a window replaces the older one, and windows a
-turn event does not report (such as Claude's per-model week) keep their last value,
-shown with “(as of 2 h ago)” when older than the rest. When a probe fails, `/usage` shows the stored data with its
+Results are kept in `usage.json` in the state directory (mode 0600), merged per
+window (Codex by limit and primary/secondary slot, Claude by window name): a newer
+observation of a window replaces the older one, and windows a turn event does not
+report (such as Claude's per-model week) keep their last value, shown with
+“(as of 2 h ago)” when older than the rest. Restrictions and notes come only from
+the newest result. A turn never waits for the store: if another process holds its
+lock, that observation is skipped. When a probe fails, `/usage` shows the stored data with its
 age and source (for example “last seen in a turn 2 h ago”) and the probe error;
 with nothing stored the executor is “unknown”. Reset times are shown as time left
 when the provider gives an exact time; Claude's text is converted using its time

@@ -58,9 +58,14 @@ def test_claude_text_parses_windows_and_reset_times():
     assert week['resets_text'] == 'Nov 20, 1pm (Europe/Amsterdam)'
 
 
-def test_reset_year_is_nearest_future_and_unknown_formats_keep_text():
+def test_reset_year_is_nearest_to_now_and_unknown_formats_keep_text():
     december = datetime(2026, 12, 30, 12, tzinfo=AMS).timestamp()
     assert usage.reset_epoch('Jan 2, 12am (Europe/Amsterdam)', december) == datetime(2027, 1, 2, 0, 0, tzinfo=AMS).timestamp()
+    # Two hours in the past stays in the past, not next year.
+    assert usage.reset_epoch('Nov 14, 8am (Europe/Amsterdam)', NOW) == NOW - 7200
+    assert usage.reset_epoch('Dec 31, 11pm (Europe/Amsterdam)', datetime(2027, 1, 1, 1, tzinfo=AMS).timestamp()) == \
+        datetime(2026, 12, 31, 23, tzinfo=AMS).timestamp()
+    assert usage.reset_epoch('9am (Europe/Amsterdam)', NOW) == NOW - 3600
     assert usage.reset_epoch('Nov 20, 1pm (Mars/Olympus)', NOW) is None
     assert usage.reset_epoch('in 3 hours', NOW) is None
     snap = usage.parse_claude(claude_result('Current session: 5% used · resets soon-ish'), NOW)
@@ -81,7 +86,7 @@ def test_claude_garbage_or_model_turn_is_a_failure(stdout, reason):
 
 def test_codex_result_parsing_without_private_ids():
     snap = usage.parse_codex(CODEX_RESULT, NOW)
-    assert snap['windows'] == [usage.window('week', 51, 1795010673, observed_at=NOW)]
+    assert snap['windows'] == [usage.window('week', 51, 1795010673, observed_at=NOW, key='codex:primary')]
     assert snap['plan'] == 'prolite' and snap['notes'] == {'reset_credits': 3}
     assert 'secret' not in json.dumps(snap)
 
@@ -122,10 +127,10 @@ def test_observe_both_event_shapes_and_ignores_other_lines():
 def test_store_keeps_newest_and_passive_older_does_not_overwrite_live(tmp_path):
     store = usage.UsageStore(tmp_path / 'state' / 'usage.json')
     live = usage.snapshot('claude', 'live', NOW, [usage.window('session', 46)])
-    assert store.update(live)
+    assert store.update(live) == live
     older = usage.snapshot('claude', 'turn', NOW - 60, [usage.window('session', 40)])
-    assert not store.update(older)
-    assert not store.update(usage.snapshot('claude', 'none', None, error='live probe failed: x'))
+    assert store.update(older) == live
+    assert store.update(usage.snapshot('claude', 'none', None, error='live probe failed: x')) is None
     assert store.load()['claude'] == live
     newer = {**older, 'observed_at': NOW + 60, 'windows': [{**older['windows'][0], 'observed_at': NOW + 60}]}
     assert store.update(newer) and store.load()['claude'] == newer
@@ -156,10 +161,10 @@ def test_turn_event_merges_windows_by_name_into_live_probe(tmp_path):
     merged = store.load()['claude']
     assert [(w['name'], w['used_percent']) for w in merged['windows']] == [
         ('session', 50), ('week (all models)', 13), ('week (Fable)', 20)]
-    assert merged['observed_at'] == NOW + 700 and merged['notes'] == {'status': 'allowed'}
+    assert merged['observed_at'] == NOW + 700 and merged['notes'] == {}  # Notes: newest snapshot only.
     # Plan comes from the newest snapshot that has one.
     store.update(usage.parse_codex(CODEX_RESULT, NOW))
-    store.update(usage.snapshot('codex', 'turn', NOW + 60, [usage.window('week', 52, 1795010673)]))
+    store.update(usage.snapshot('codex', 'turn', NOW + 60, [usage.window('week', 52, 1795010673, key='codex:primary')]))
     codex = store.load()['codex']
     assert codex['plan'] == 'prolite' and codex['windows'][0]['used_percent'] == 52
 
@@ -173,6 +178,57 @@ def test_old_store_without_window_times_still_loads(tmp_path):
     assert store.load()['claude']['windows'][0]['observed_at'] == NOW
     assert store.update(usage.snapshot('claude', 'turn', NOW + 5, [usage.window('week (all models)', 12)]))
     assert [w['observed_at'] for w in store.load()['claude']['windows']] == [NOW, NOW + 5]
+
+
+def test_codex_windows_merge_by_stable_key_and_cleared_notes_stay_cleared(tmp_path):
+    store = usage.UsageStore(tmp_path / 'usage.json')
+    limit = {'limitId': 'codex', 'primary': {'usedPercent': 10, 'windowDurationMins': 300}, 'planType': 'plus',
+             'rateLimitReachedType': 'primary'}
+    other = {'limitId': 'spark', 'primary': {'usedPercent': 5, 'windowDurationMins': 60}}
+    store.update(usage.parse_codex({'rateLimitsByLimitId': {'codex': limit, 'spark': other},
+                                    'ordinaryUsageAllowed': False}, NOW))
+    cleared = {**limit, 'primary': {'usedPercent': 20, 'windowDurationMins': 300}, 'rateLimitReachedType': None}
+    merged = store.update(usage.parse_codex({'rateLimits': cleared, 'ordinaryUsageAllowed': True}, NOW + 60, 'turn'))
+    assert [(w['key'], w['name'], w['used_percent']) for w in merged['windows']] == [
+        ('codex:primary', '5 h', 20), ('spark:primary', 'spark 60 min', 5)]
+    assert merged['notes'] == {} and merged['plan'] == 'plus'
+    assert 'not allowed' not in usage.format_usage([merged], NOW + 60)
+
+
+async def test_service_returns_the_merged_snapshot(tmp_path, monkeypatch):
+    service = usage.UsageService(tmp_path, 'unused', 'unused')
+    async def probe_claude(binary, timeout):
+        # A turn reports newer usage while the probe runs.
+        service.observe({'type': 'rate_limit_event', 'rate_limit_info': {'unifiedWindows': {
+            'five_hour': {'utilization': 0.8, 'resetsAt': 1794651000}}}})
+        return usage.parse_claude(claude_result(), time.time() - 5)
+    async def probe_codex(binary, timeout):
+        return usage.snapshot('codex', 'none', None, error='live probe failed: x')
+    monkeypatch.setattr(usage, 'probe_claude', probe_claude)
+    monkeypatch.setattr(usage, 'probe_codex', probe_codex)
+    claude, codex = await service.snapshot()
+    assert [(w['name'], w['used_percent']) for w in claude['windows']] == [
+        ('session', 80), ('week (all models)', 12), ('week (Fable)', 19)]
+    assert claude['source'] == 'turn' and codex['windows'] == []
+
+
+def test_observe_skips_when_the_store_is_locked(tmp_path):
+    import fcntl
+    service = usage.UsageService(tmp_path)
+    event = {'method': 'account/rateLimits/updated', 'params': {'rateLimits': CODEX_RESULT['rateLimits']}}
+    service.observe(event)  # Creates the lock file.
+    before = service.store.path.read_text()
+    holder = os.open(tmp_path / 'usage.json.lock', os.O_RDWR)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        started = time.monotonic()
+        assert service.observe({**event, 'params': {'rateLimits': {**CODEX_RESULT['rateLimits'], 'planType': 'pro'}}})
+        assert time.monotonic() - started < 0.5
+        with pytest.raises(usage.StoreBusy):
+            service.store.update(usage.parse_codex(CODEX_RESULT, time.time()), lock_timeout=0.05)
+    finally:
+        os.close(holder)
+    assert service.store.path.read_text() == before
 
 
 def test_format_live_stale_and_unknown_without_tables():
@@ -244,6 +300,40 @@ time.sleep(60)
     snap = await usage.probe_claude(binary, timeout=1)
     assert 'timed out after 1 s' in snap['error'] and snap['windows'] == []
     assert time.monotonic() - started < 5
+    await until(lambda: not any(alive(pid) for pid in json.loads(pids.read_text())))
+
+
+DETACHED = '''
+import json, os, subprocess, sys, time
+detached = subprocess.Popen(["sleep", "60"], start_new_session=True)
+json.dump([os.getpid(), detached.pid], open({pids!r}, "w"))
+'''
+
+
+async def test_flooding_probe_ignoring_sigterm_is_cleaned_up_with_detached_child(tmp_path):
+    pids = tmp_path / 'pids.json'
+    binary = script(tmp_path, 'codex', DETACHED.format(pids=str(pids)) + '''
+import signal
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+sys.stdout.write("x" * (4 * 1024 * 1024))  # One line over the reader limit, never read to EOF.
+sys.stdout.flush()
+time.sleep(60)
+''')
+    started = time.monotonic()
+    snap = await usage.probe_codex(binary, timeout=2)
+    assert snap['error'].startswith('live probe failed') and snap['windows'] == []
+    assert time.monotonic() - started < 2 + usage.GRACE + 3
+    await until(lambda: not any(alive(pid) for pid in json.loads(pids.read_text())))
+
+
+async def test_cancelled_probe_leaves_no_process(tmp_path):
+    pids = tmp_path / 'pids.json'
+    binary = script(tmp_path, 'claude', DETACHED.format(pids=str(pids)) + 'time.sleep(60)\n')
+    job = asyncio.create_task(usage.probe_claude(binary, timeout=30))
+    await until(lambda: pids.exists() and pids.read_text())
+    job.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(job, 5)
     await until(lambda: not any(alive(pid) for pid in json.loads(pids.read_text())))
 
 
