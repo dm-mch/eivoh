@@ -13,13 +13,26 @@ STATE = '.eivoh-template'
 TEMPLATES = 'templates/home'  # Location of the templates inside the core repository.
 
 
+def create(path: Path, data: bytes):
+    # O_EXCL|O_NOFOLLOW: never write through a symlink or a path that appeared meanwhile.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(data)
+
+
 def seed(home: Path, templates: Path, core: Path, commit: str):
     core = core.resolve()
     if not templates.is_dir():
         raise OSError(f'Templates directory {templates} is not readable')
     home.mkdir(parents=True, exist_ok=True)
+    state = home / STATE
+    if state.is_symlink():
+        print(f'Notice: {state} is a symlink; the home was left untouched.')
+        return
+    first = not state.exists()
     def fail(exc):
         raise exc
+    skipped = []
     for directory, _, files in sorted(os.walk(templates, onerror=fail)):  # Does not descend into symlinks.
         for name in sorted(files):
             source = Path(directory, name)
@@ -32,24 +45,26 @@ def seed(home: Path, templates: Path, core: Path, commit: str):
             parents = [home / Path(*relative.parts[:i]) for i in range(1, len(relative.parts))]
             if target.is_symlink() or target.exists() or any(
                     path.is_symlink() or (path.exists() and not path.is_dir()) for path in parents):
+                skipped.append(str(relative))
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            data = source.read_bytes().replace(PLACEHOLDER.encode(), str(core).encode())
-            # O_EXCL: never write through a path that appeared meanwhile.
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, 'wb') as out:
-                out.write(data)
+            create(target, source.read_bytes().replace(PLACEHOLDER.encode(), str(core).encode()))
             print(f'Seeded {target}')
-    reconcile(home, core, commit)
+    if first:
+        create(state, (commit + '\n').encode())
+        if skipped:
+            # An existing repository became the home: these were never compared with the templates.
+            print(f'Notice: first seeding of {home}; these template files were not seeded because the path '
+                  f'already existed: {", ".join(skipped)}. Compare them with {core / TEMPLATES} by hand.')
+    else:
+        reconcile(home, core, commit)
     if not (home / '.git').exists():
         print(f'Hint: the home {home} should be a private git repository (git init).')
 
 
 def reconcile(home: Path, core: Path, commit: str):
+    """Report template changes; never write. The agent advances the marker when it merges."""
     state = home / STATE
-    if not state.exists():
-        state.write_text(commit + '\n')
-        return
     old = state.read_text().strip()
     if old == commit:
         return
@@ -63,12 +78,10 @@ def reconcile(home: Path, core: Path, commit: str):
     except (OSError, ValueError) as exc:
         print(f'Notice: could not compare the home templates between {old} and {commit}; {state} left unchanged. {exc}')
         return
-    changed = result.stdout.split()
-    if not changed:
-        state.write_text(commit + '\n')
-        return
-    print(f'Notice: the home templates changed between {old} and {commit}: {", ".join(changed)}. '
-          f'The home was not modified; merge the change as a task (see "Changing yourself" in {home / "AGENTS.md"}).')
+    if changed := result.stdout.split():
+        print(f'Notice: the home templates changed between {old} and {commit}: {", ".join(changed)}. '
+              'Existing files in the home were not modified; merge the change as a task '
+              f'(see "Changing yourself" in {home / "AGENTS.md"}).')
 
 
 def main(argv=None):

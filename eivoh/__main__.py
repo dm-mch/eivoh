@@ -12,7 +12,7 @@ from .executors.claude import ClaudeStreamExecutor
 from .executors.codex_app import CodexAppExecutor
 from .gateway import Gateway
 from .speech import make_transcriber
-from .storage import Storage
+from .storage import LegacyWorkdirRequired, Storage
 from .titles import ClaudeTitleExecutor, CodexTitleExecutor
 
 
@@ -82,9 +82,15 @@ def main():
     # HTTP URLs contain the bot token. Never log request URLs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # 78 (RestartPreventExitStatus in the unit): configuration errors, which a restart cannot fix.
     try:
-        asyncio.run(serve(Config.from_env()))
-    except ConsumerConflict as exc:
+        config = Config.from_env()
+    except ValueError as exc:
+        logging.getLogger(__name__).error('Configuration error: %s', exc)
+        raise SystemExit(78) from None
+    try:
+        asyncio.run(serve(config))
+    except (ConsumerConflict, LegacyWorkdirRequired) as exc:
         logging.getLogger(__name__).error('%s', exc)
         raise SystemExit(78) from None
 

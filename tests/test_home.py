@@ -51,6 +51,10 @@ def test_seeds_missing_files_only(tmp_path, capsys):
     assert sorted(line for line in out.splitlines() if line.startswith('Seeded')) == [
         f'Seeded {home / ".hidden"}', f'Seeded {home / "AGENTS.md"}']
     assert (home / '.eivoh-template').read_text() == 'c1\n'
+    # First seeding into existing files: name the ones never compared with the templates.
+    notice = next(line for line in out.splitlines() if line.startswith('Notice'))
+    assert 'were not seeded because the path already existed: README.md, notes.md, experience/index.md, skills/one.md' in notice
+    assert 'by hand' in notice
     assert 'should be a private git repository (git init)' in out and not (home / '.git').exists()
     (home / 'AGENTS.md').write_text('edited\n')
     (home / '.git').mkdir()
@@ -70,22 +74,24 @@ def test_template_changes_are_reported_not_applied(tmp_path, capsys):
     first = git(core, 'rev-parse', 'HEAD')
     (home / '.git').mkdir(parents=True)
     assert run(capsys, home, templates, core, first) == (0, f'Seeded {home / "AGENTS.md"}\n')
-    # A core change outside the templates: the state moves silently.
+    # A core change outside the templates: silent, and the marker is not rewritten.
     (core / 'code.py').write_text('2\n')
     git(core, 'commit', '-qam', 'two')
     second = git(core, 'rev-parse', 'HEAD')
     assert run(capsys, home, templates, core, second) == (0, '')
-    assert (home / '.eivoh-template').read_text() == second + '\n'
-    # A template change: reported, nothing written, the state stays.
+    assert (home / '.eivoh-template').read_text() == first + '\n'
+    # A template change: reported, existing files and the marker untouched; a new template file is seeded.
     (templates / 'AGENTS.md').write_text('v2\n')
-    git(core, 'commit', '-qam', 'three')
+    (templates / 'NEW.md').write_text('new\n')
+    git(core, 'add', '.')
+    git(core, 'commit', '-qm', 'three')
     third = git(core, 'rev-parse', 'HEAD')
     code, out = run(capsys, home, templates, core, third)
-    assert code == 0
-    assert second in out and third in out and 'templates/home/AGENTS.md' in out
-    assert 'home was not modified' in out and 'Changing yourself' in out
+    assert code == 0 and out.startswith(f'Seeded {home / "NEW.md"}\n')
+    assert first in out and third in out and 'templates/home/AGENTS.md, templates/home/NEW.md' in out
+    assert 'Existing files in the home were not modified' in out and 'Changing yourself' in out
     assert (home / 'AGENTS.md').read_text() == 'v1\n'
-    assert (home / '.eivoh-template').read_text() == second + '\n'
+    assert (home / '.eivoh-template').read_text() == first + '\n'
     # Unknown old commit: cannot compare, state unchanged.
     (home / '.eivoh-template').write_text('0' * 40 + '\n')
     code, out = run(capsys, home, templates, core, third)
@@ -101,6 +107,17 @@ def test_not_a_repository_cannot_compare(tmp_path, capsys):
     code, out = run(capsys, home, templates, tmp_path / 'not-a-repo', 'new')
     assert code == 0 and 'could not compare' in out
     assert (home / '.eivoh-template').read_text() == 'old\n'
+
+
+def test_symlinked_marker_leaves_home_untouched(tmp_path, capsys):
+    templates, home = tmp_path / 'templates', tmp_path / 'home'
+    templates.mkdir()
+    (templates / 'AGENTS.md').write_text('x\n')
+    home.mkdir()
+    (home / '.eivoh-template').symlink_to(tmp_path / 'elsewhere')
+    code, out = run(capsys, home, templates, tmp_path, 'c1')
+    assert code == 0 and 'is a symlink' in out
+    assert not (tmp_path / 'elsewhere').exists() and not (home / 'AGENTS.md').exists()
 
 
 def test_real_errors_fail(tmp_path, capsys):

@@ -21,7 +21,7 @@ def test_home_and_legacy_workdir(monkeypatch, tmp_path, home):
         else:
             monkeypatch.setenv('EIVOH_WORKDIR', value)
         config = Config.from_env()
-        assert config.home == home and config.workdir == home
+        assert config.home == home and config.workdir is None
     monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path))
     assert (Config.from_env().home, Config.from_env().workdir) == (home, tmp_path)
     monkeypatch.setenv('EIVOH_WORKDIR', str(tmp_path / 'missing'))
@@ -186,3 +186,21 @@ def test_codex_app_server_option_missing_values(monkeypatch, tmp_path, value):
     monkeypatch.setenv('EIVOH_CODEX_ARGS', value)
     with pytest.raises(ValueError, match='requires'):
         Config.from_env()
+
+
+def test_startup_configuration_errors_exit_78(monkeypatch):
+    # RestartPreventExitStatus=78: systemd must not restart-loop on these.
+    import eivoh.__main__ as entry
+    from eivoh.storage import LegacyWorkdirRequired
+
+    monkeypatch.delenv('EIVOH_TELEGRAM_TOKEN', raising=False)
+    with pytest.raises(SystemExit) as exit_info:
+        entry.main()
+    assert exit_info.value.code == 78
+    monkeypatch.setattr(entry.Config, 'from_env', classmethod(lambda cls: object()))
+    async def serve(config):
+        raise LegacyWorkdirRequired('EIVOH_WORKDIR must be set')
+    monkeypatch.setattr(entry, 'serve', serve)
+    with pytest.raises(SystemExit) as exit_info:
+        entry.main()
+    assert exit_info.value.code == 78

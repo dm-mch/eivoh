@@ -77,7 +77,7 @@ must exist, and `deploy/release.sh` seeds it from `templates/home/`. A task keep
 the directory it was created in, because an executor session is bound to its
 directory. `EIVOH_WORKDIR` is only the directory of tasks created before the home
 existed; set it when upgrading an installation that used it, otherwise leave it
-unset. Use absolute paths in the environment file. Defaults: home `~/eivoh-home`,
+unset. The service refuses to start when such tasks exist and it is unset. Use absolute paths in the environment file. Defaults: home `~/eivoh-home`,
 state in `~/.local/state/eivoh`, no model override, permission mode
 `bypassPermissions`, binary `claude`.
 The default permission mode allows tools without interactive approval; other
@@ -365,11 +365,25 @@ does not edit that release. The release script also seeds the
 agent's home (`EIVOH_HOME`, by default `~/eivoh-home`) from `templates/home/`: it
 adds missing files, never overwrites an existing one, and records in
 `.eivoh-template` the core commit the home was reconciled with. When the templates
-changed since that commit it prints a notice and leaves the home as it is; the
-agent merges the change as a task. Keep the home a private git repository. The script
+changed since that commit it prints a notice and leaves existing files as they are;
+the agent merges the change as a task and then advances the recorded commit. A
+template file that is missing from the home, including one deleted there, is seeded
+again. Run the script from the main checkout, not from a linked worktree: the path
+of the checkout it runs from is written into the seeded `AGENTS.md`. Keep the home a private git repository. The script
 takes the home from `EIVOH_HOME` in the shell that runs it, not from the service's
 environment file: export it when the home is not at the default path. The service
-does not start until the home exists, so release before the first restart. Release a commit containing the implementation before
+does not start until the home exists, so release before the first restart.
+
+Projects live outside the home. A Claude permission mode or a Codex sandbox that
+confines edits to the working directory would confine them to the home; the
+defaults do not.
+
+Upgrading an installation whose private repository was nested in the core as
+`private/`: keep `EIVOH_WORKDIR` pointing at the old working directory; before the
+first release, move that repository to the home path and leave a `private` link to
+it in the core checkout, so that open tasks keep finding it. The first seeding
+lists the files that already existed there and were not taken from the templates;
+compare them with the templates by hand. Release a commit containing the implementation before
 installing the systemd **user** service (no sudo):
 
 ```sh

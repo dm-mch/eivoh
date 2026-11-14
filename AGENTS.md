@@ -33,6 +33,6 @@ See [ROADMAP.md](ROADMAP.md) for the current stage and what already works. The c
 # Repositories and completion
 
 * This section is the only place for the rules on publishing this repository; other documents refer to it. The private part is the agent's home, a separate private repository outside this one: the agent's rules, experience, archives, personal skills and notes. A `private` entry in this checkout, when present, is a link to the home kept for tasks opened before the move, and is ignored by the core.
-* Before a public PR, check all the material to be published for private data. Personal events, correspondence, tasks and conclusions stay in the home. Move only acceptable generalisations and anonymised examples into the public core. Do not write down passwords, keys or tokens. If it is unclear whether material is private, do not publish it until this is clarified.
+* Before a public PR, apply the privacy rule of the home's `AGENTS.md`, section "Privacy", to all the material to be published.
 * Commit core changes to the working branch `work` and use them immediately. Prepare the PR from it into `main` on your own, after the privacy check. A merge into `main` is possible only after a human approves: the approval concerns the public version, not the agent's work on its own branch.
 * In the final message, state the changes made, the checks performed, the limitations and the decisions that remain open. Do not claim that a component is implemented or that something improved without evidence.

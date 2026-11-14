@@ -143,6 +143,10 @@ MIGRATIONS = (
 )
 
 
+class LegacyWorkdirRequired(ValueError):
+    """Old tasks have no recorded folder; guessing one would break their resume."""
+
+
 class Storage:
     def __init__(self, path: Path, default_executor="claude", *, task_workdir=None, legacy_workdir=None):
         """task_workdir: working folder of tasks created from now on.
@@ -174,6 +178,12 @@ class Storage:
                 self.db.execute(f"PRAGMA user_version={index + 1}")
             if legacy_workdir is not None:
                 self.db.execute("UPDATE task SET workdir=? WHERE workdir IS NULL", (str(Path(legacy_workdir).resolve()),))
+            if task_workdir is not None:
+                # Rolled back with the migrations below: a later start with the folder repairs it.
+                missing = self.db.execute("SELECT COUNT(*) FROM task WHERE workdir IS NULL").fetchone()[0]
+                if missing:
+                    raise LegacyWorkdirRequired(f"EIVOH_WORKDIR must be set: {missing} task(s) created before "
+                                                "the agent's home existed have no working folder")
             self.db.commit()
         except BaseException:
             self.db.rollback()

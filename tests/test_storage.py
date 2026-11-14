@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from eivoh.executors.claude import parse_line
-from eivoh.storage import Storage
+from eivoh.storage import LegacyWorkdirRequired, Storage
 from conftest import inbound
 
 
@@ -333,6 +333,12 @@ def test_task_workdir_migration_backfill_and_fixed_at_creation(tmp_path, monkeyp
             store.db.execute("INSERT INTO turn(id,inbound_id,conversation_id,task_id,status,executor) VALUES (1,1,1,1,'running','claude')")
         old = store.inbound(1)
         store.close()
+    # Without the legacy folder the start fails and leaves the database as it was.
+    with pytest.raises(LegacyWorkdirRequired, match=r'EIVOH_WORKDIR must be set: 1 task\(s\)'):
+        Storage(path, task_workdir=home)
+    with sqlite3.connect(path) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert 'workdir' not in {row[1] for row in db.execute('PRAGMA table_info(task)')}
     store = Storage(path, task_workdir=home, legacy_workdir=legacy)
     assert store.db.execute('PRAGMA user_version').fetchone()[0] == 9
     assert store.inbound(old['id'])['text'] == 'before'
@@ -349,6 +355,14 @@ def test_task_workdir_migration_backfill_and_fixed_at_creation(tmp_path, monkeyp
     assert [row[0] for row in store.db.execute('SELECT workdir FROM task ORDER BY id')] == [str(legacy), str(home)]
     assert store.claim(fresh['id'], 3)[0]['workdir'] == str(home)
     store.close()
+
+
+def test_fresh_database_needs_no_legacy_workdir(tmp_path):
+    store = Storage(tmp_path / 'fresh.db', task_workdir=tmp_path)
+    turn, _ = store.claim(store.journal(inbound(1, 'work'))['id'], 3)
+    assert turn['workdir'] == str(tmp_path)
+    store.close()
+    Storage(tmp_path / 'fresh.db', task_workdir=tmp_path).close()
 
 
 def test_task_workdir_unset_without_parameters(tmp_path):

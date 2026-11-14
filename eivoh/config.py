@@ -36,7 +36,7 @@ class Config:
     telegram_token: str
     owner_id: int
     state_dir: Path
-    workdir: Path  # Working directory of tasks created before V3.1.
+    workdir: Path | None  # Working directory of tasks created before V3.1; None if unset.
     home: Path  # The agent's home: working directory of every new task.
     claude_model: str | None = None
     permission_mode: str = "bypassPermissions"
@@ -58,7 +58,7 @@ class Config:
         home = Path(os.environ.get("EIVOH_HOME", "").strip() or "~/eivoh-home").expanduser().resolve()
         if not home.is_dir():
             raise ValueError(f"EIVOH_HOME {home} does not exist; deployment (deploy/release.sh) seeds it")
-        workdir = home
+        workdir = None
         if os.environ.get("EIVOH_WORKDIR", "").strip():
             workdir = Path(os.environ["EIVOH_WORKDIR"]).expanduser().resolve()
             if not workdir.is_dir():

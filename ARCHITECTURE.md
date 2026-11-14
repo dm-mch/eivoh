@@ -35,7 +35,7 @@ Predictor, Strategy Policy and Learner are roles, not trained models. They are p
 
 * Evolution changes memory, strategies, skills and code, improves existing modules and creates new ones. ARCHITECTURE.md defines the components and interfaces; the detailed change cycle belongs to EVOLUTION.md.
 * Changes are traceable and reversible. The reflection cycle, the checking of expectations from a change, and recovery are described in [EVOLUTION.md](EVOLUTION.md).
-* The public core is separate from personal data and experience. The rules on repositories and privacy are in [AGENTS.md](AGENTS.md).
+* The public core is separate from personal data and experience. The rules on privacy are in the `AGENTS.md` of the agent's home; the rules on publishing the core are in [AGENTS.md](AGENTS.md).
 
 # Candidates for reuse
 
