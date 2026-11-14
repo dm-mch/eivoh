@@ -484,7 +484,7 @@ async def test_task_list_shows_compact_lifetime(held):
     gateway, storage, _, channel, _ = held
     for mid, (title, created) in enumerate([('young', '-30 seconds'), ('hours', '-5 hours'), ('days', '-3 days')], 1):
         await gateway.receive(inbound(mid, f'/new {title}'))
-        storage.db.execute("UPDATE task SET created_at=datetime('now', ?) WHERE id=?", (created, mid))
+        storage.db.execute("UPDATE task SET created_at=datetime(last_active, ?) WHERE id=?", (created, mid))
     await gateway.receive(inbound(9, '/tasks'))
     lines = channel.sent[-1][1].splitlines()
     detail = {name: lines[i + 1] for name in ('young', 'hours', 'days') for i, line in enumerate(lines) if f'`{name}`' in line}
