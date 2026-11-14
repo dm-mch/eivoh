@@ -98,7 +98,7 @@ async def test_rich_photo_admission_reply_preparation_and_redelivery(telegram_ri
     assert storage.db.execute('SELECT COUNT(*) FROM inbound').fetchone()[0] == 3
 
 
-async def test_rich_text_only_document_order_and_unknown_types(telegram_rig):
+async def test_rich_text_only_document_order_and_inline_fallback(telegram_rig):
     channel, storage, bot, _, _ = telegram_rig
     await poll(channel, [rich([
         dict(type='heading', size=1, text='Heading'),
@@ -109,7 +109,7 @@ async def test_rich_text_only_document_order_and_unknown_types(telegram_rig):
             ' ', dict(type='url', text='https://same.test', url='https://same.test'),
             ' ', dict(type='button', button=dict(text='Button', callback_data='hidden')),
             ' ', dict(type='future_text', text=['future ', dict(type='code', text='visible')]),
-            dict(type='future_no_text', secret='ignored'), None, 123]),
+            ]),
         dict(type='pre', text='a\n  b', language='python'),
         dict(type='footer', text='Footer'),
         dict(type='blockquote', blocks=[dict(type='paragraph', text='Quoted')], credit='Author'),
@@ -121,16 +121,12 @@ async def test_rich_text_only_document_order_and_unknown_types(telegram_rig):
         dict(type='table', cells=[[dict(text='A'), dict(text='B')],
                                  [dict(text='C'), dict(text='D')]], caption='Table caption'),
         dict(type='mathematical_expression', expression=r'\sum_i x_i'),
-        dict(type='buttons', buttons=[dict(text='One', url='https://one.test'),
-                                     dict(text='Two', callback_data='hidden')]),
-        dict(type='map', caption=dict(text='Map caption', credit='Map credit')),
-        dict(type='future_block', text='Block fallback'), dict(type='future_no_text'),
-        dict(type='divider'), dict(type='anchor', name='hidden'), None,
+        dict(type='divider'), dict(type='anchor', name='hidden'),
     ])])
     row = storage.inbound(1)
     assert row['text'] == ('Heading\nplain nested 🙂 x^2 link (https://example.test) https://same.test Button future visible\n'
         'a\n  b\nFooter\nQuoted\nAuthor\nExpandable\nSource\nPull quote\nCredit\na) First\n• Second\n'
-        'Summary\nInside\nA | B\nC | D\nTable caption\n\\sum_i x_i\nOne Two\nMap caption\nMap credit\nBlock fallback')
+        'Summary\nInside\nA | B\nC | D\nTable caption\n\\sum_i x_i')
     assert row['preparation'] == 'ready' and json.loads(row['attachments']) == []
     assert storage.turn_for(1) is not None
     bot.get_file.assert_not_awaited()
@@ -330,7 +326,7 @@ async def test_malformed_rich_types_fail_durably_and_poll_continues(telegram_rig
     bot.get_file.assert_not_awaited()
 
 
-@pytest.mark.parametrize('shape', ['blocks', 'text', 'wide', 'nodes'])
+@pytest.mark.parametrize('shape', ['blocks', 'text', 'wide'])
 async def test_rich_traversal_limits_fail_durably(telegram_rig, caplog, shape):
     channel, storage, bot, gateway, executor = telegram_rig
     block = dict(type='paragraph', text='do-not-log-deep')
@@ -342,8 +338,6 @@ async def test_rich_traversal_limits_fail_durably(telegram_rig, caplog, shape):
         for _ in range(1200):
             text = dict(type='bold', text=text)
         block = dict(type='paragraph', text=text)
-    if shape == 'nodes':
-        block = dict(type='paragraph', text=['do-not-log-part'] * 270000)
     blocks = [block] * 5000 if shape == 'wide' else [block]
     await poll(channel, [rich(blocks)], gateway.receive)
     await until(lambda: storage.inbound(1)['preparation'] == 'failed' and bot.send_message.called)
@@ -499,3 +493,144 @@ async def test_unparseable_rich_reply_keeps_its_task(telegram_rig):
     reply = dict(message_id=7, date=1, chat=dict(id=10, type='private'))
     await poll(channel, [rich([dict(type='list', items=1)], uid=32, mid=5, reply_to_message=reply)], gateway.receive)
     assert storage.inbound(3)['reply_to'] == '7' and storage.turn_for(3)['task_id'] == 1
+
+
+@pytest.mark.parametrize('caption', [None, '/stop'])
+async def test_rich_map_never_loses_content_or_executes_command(telegram_rig, caption, caplog):
+    channel, storage, bot, gateway, executor = telegram_rig
+    await gateway.receive(Inbound('telegram', '10', '1', '1', 'running task'))
+    await until(lambda: executor.calls)
+    block = dict(type='map', location=dict(latitude=12.3456, longitude=65.4321), zoom=10, width=400, height=300)
+    if caption is not None:
+        block['caption'] = dict(text=caption)
+    blocks = [block] if caption else [dict(type='paragraph', text='do-not-log-meet-here'), block]
+    await poll(channel, [rich(blocks)], gateway.receive)
+    assert storage.turn_for(1)['status'] == 'running'
+    row = storage.inbound(2)
+    assert any('map' in field for item in json.loads(row['attachments']) for field in item.get('content_fields', []))
+    await until(lambda: storage.inbound(2)['preparation'] == 'failed')
+    assert 'map' in storage.inbound(2)['prepared_text']
+    executor.releases[1].set()
+    await until(lambda: storage.turn_for(2)['status'] == 'failed' and
+        any('map' in call.kwargs.get('text', '') and 'not supported' in call.kwargs['text'] for call in bot.send_message.call_args_list))
+    assert len(executor.calls) == 1 and 'do-not-log' not in caplog.text and '12.3456' not in caplog.text
+
+
+@pytest.mark.parametrize('kind', ['map', 'buttons', 'future_widget'])
+@pytest.mark.parametrize('nested', [False, True])
+async def test_unsupported_rich_blocks_fail_visibly_by_type(telegram_rig, kind, nested, caplog):
+    channel, storage, bot, gateway, executor = telegram_rig
+    block = dict(type=kind, text='do-not-log-block', buttons=[dict(text='/stop', callback_data='do-not-log-data')])
+    if nested:
+        block = dict(type='details', summary='Summary', blocks=[dict(type='list', items=[dict(label='1.', blocks=[
+            dict(type='blockquote', blocks=[dict(type='collage', blocks=[block])])])])])
+    await poll(channel, [rich([dict(type='paragraph', text='/stop'), block])], gateway.receive)
+    row = storage.inbound(1)
+    assert any(kind in field for item in json.loads(row['attachments']) for field in item.get('content_fields', []))
+    await until(lambda: storage.inbound(1)['preparation'] == 'failed' and bot.send_message.called)
+    assert kind in storage.inbound(1)['prepared_text'] and not executor.calls
+    assert any(kind in call.kwargs.get('text', '') and 'not supported' in call.kwargs['text'] for call in bot.send_message.call_args_list)
+    assert 'do-not-log' not in caplog.text
+
+
+async def test_unknown_inline_without_text_fails_visibly(telegram_rig):
+    channel, storage, bot, gateway, executor = telegram_rig
+    await poll(channel, [rich([dict(type='paragraph', text=['/stop', dict(type='future_inline', data='do-not-log')])])], gateway.receive)
+    row = storage.inbound(1)
+    assert any('future_inline' in field for item in json.loads(row['attachments']) for field in item.get('content_fields', []))
+    await until(lambda: storage.inbound(1)['preparation'] == 'failed' and bot.send_message.called)
+    assert 'future_inline' in storage.inbound(1)['prepared_text'] and not executor.calls
+
+
+async def test_dense_rich_text_with_four_wrappers_is_accepted(telegram_rig):
+    channel, storage, bot, _, _ = telegram_rig
+    parts = []
+    expected = ''.join(chr(97 + index % 26) for index in range(32767))
+    for index, char in enumerate(expected):
+        text = char
+        for kind in ('bold', 'italic', 'underline', 'strikethrough' if index % 2 else 'spoiler'):
+            text = dict(type=kind, text=text)
+        parts.append(text)
+    await poll(channel, [rich([dict(type='paragraph', text=parts)])])
+    row = storage.inbound(1)
+    assert row['preparation'] == 'ready' and row['text'] == expected
+    assert json.loads(row['attachments']) == []
+    bot.get_file.assert_not_awaited()
+
+
+@pytest.mark.parametrize('kind', ['rich', 'plain'])
+@pytest.mark.parametrize('setting', ['/effort high', '/model claude opus'])
+async def test_media_settings_notice_after_preparation_once(telegram_rig, monkeypatch, kind, setting):
+    channel, storage, bot, gateway, executor = telegram_rig
+    await gateway.receive(Inbound('telegram', '10', '1', '1', 'running task'))
+    await until(lambda: executor.calls)
+    await gateway.receive(Inbound('telegram', '10', '1', '2', setting))
+    entered, release = asyncio.Event(), asyncio.Event()
+    bot.get_file.return_value = SimpleNamespace(file_path='https://example.test/image', file_size=3)
+    async def download(url, path):
+        entered.set()
+        await release.wait()
+        path.write_bytes(b'jpg')
+    monkeypatch.setattr('eivoh.channels.telegram.download_file', download)
+    message = rich([photo_block()]) if kind == 'rich' else update(photo=[photo()])
+    await poll(channel, [message], gateway.receive)
+    await entered.wait()
+    def notices():
+        return [call for call in bot.send_message.call_args_list if 'using the selected model and effort' in call.kwargs.get('text', '')]
+    assert not notices()
+    release.set()
+    await until(lambda: storage.inbound(3)['preparation'] == 'ready' and notices())
+    assert len(notices()) == 1
+    await poll(channel, [message], gateway.receive)
+    await asyncio.sleep(0)
+    assert len(notices()) == 1
+    assert len(storage.delivery_parts('telegram', '10', 'inbound:3:admission')) == 1
+
+
+@pytest.mark.parametrize('name', ['README.md', 'ROADMAP.md'])
+def test_rich_limits_and_failure_policy_documented(name):
+    text = (Path(__file__).parents[1] / name).read_text()
+    assert '16384 total values' not in text
+    assert '128 JSON levels' in text and '4096 blocks' in text
+    assert 'no node cap' in text and 'unsupported rich blocks fail visibly' in text
+
+
+@pytest.mark.parametrize('kind', ['rich', 'plain'])
+@pytest.mark.parametrize('reason', ['matching', 'restored', 'parent_ended'])
+async def test_media_settings_notice_omitted_when_no_longer_needed(telegram_rig, monkeypatch, kind, reason):
+    channel, storage, bot, gateway, executor = telegram_rig
+    await gateway.receive(Inbound('telegram', '10', '1', '1', 'running task'))
+    await until(lambda: executor.calls)
+    if reason != 'matching':
+        await gateway.receive(Inbound('telegram', '10', '1', '2', '/effort high'))
+    entered, release = asyncio.Event(), asyncio.Event()
+    bot.get_file.return_value = SimpleNamespace(file_path='https://example.test/image', file_size=3)
+    async def download(url, path):
+        entered.set()
+        await release.wait()
+        path.write_bytes(b'jpg')
+    monkeypatch.setattr('eivoh.channels.telegram.download_file', download)
+    message = rich([photo_block()]) if kind == 'rich' else update(photo=[photo()])
+    await poll(channel, [message], gateway.receive)
+    await entered.wait()
+    row = storage.db.execute("SELECT * FROM inbound WHERE message_id='3'").fetchone()
+    if reason == 'restored':
+        await gateway.receive(Inbound('telegram', '10', '1', '4', '/effort default'))
+    elif reason == 'parent_ended':
+        executor.releases[1].set()
+        await until(lambda: storage.turn_for(1)['status'] == 'completed')
+    release.set()
+    await until(lambda: storage.inbound(row['id'])['preparation'] == 'ready' and row['id'] not in gateway.media_jobs)
+    jobs = [job for group in gateway.notice_jobs.values() for job in group]
+    await asyncio.gather(*jobs)
+    assert not any('using the selected model and effort' in call.kwargs.get('text', '') for call in bot.send_message.call_args_list)
+    assert not storage.delivery_parts('telegram', '10', f"inbound:{row['id']}:admission")
+
+
+@pytest.mark.parametrize('kind', ['collage', 'slideshow'])
+async def test_media_container_without_media_is_not_a_command(telegram_rig, kind):
+    channel, storage, bot, gateway, executor = telegram_rig
+    await poll(channel, [rich([dict(type=kind, blocks=[], caption=dict(text='/stop'))])], gateway.receive)
+    assert json.loads(storage.inbound(1)['attachments'])[0]['kind'] == 'unsupported'
+    await until(lambda: storage.inbound(1)['preparation'] == 'failed' and bot.send_message.called)
+    assert kind in storage.inbound(1)['prepared_text'] and not executor.calls

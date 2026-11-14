@@ -55,7 +55,12 @@ chat_owner_changed chat_owner_left poll_option_added poll_option_deleted managed
 # The API allows 16 block levels; 128 JSON levels leave room for arrays and text.
 _RICH_DEPTH = 128
 _RICH_BLOCKS = 4096
-_RICH_NODES = 262144  # Above any payload within Telegram's 32768-character limit.
+_RICH_TEXT_BLOCKS = frozenset({
+    'paragraph', 'heading', 'pre', 'footer', 'blockquote', 'expandable_blockquote',
+    'pullquote', 'list', 'table', 'details', 'mathematical_expression', 'divider', 'anchor',
+})
+_RICH_MEDIA_BLOCKS = frozenset({'photo', 'document', 'voice_note', 'audio', 'video', 'animation',
+                                'collage', 'slideshow'})
 
 
 def _sequence(value):
@@ -77,21 +82,31 @@ def _unsupported(fields):
     return dict(kind='unsupported', content_fields=sorted(fields) or ['unknown'])
 
 
-def _rich_text(value):
+def _rich_text(value, unsupported):
     if isinstance(value, str):
         return value
     if isinstance(value, (list, tuple)):
-        return ''.join(_rich_text(part) for part in value)
+        return ''.join(_rich_text(part, unsupported) for part in value)
+    if value is None:
+        return ''
     if not isinstance(value, dict):
+        unsupported.append(_unsupported(['rich_text.unknown']))
         return ''
     kind = value.get('type')
+    kind = kind if isinstance(kind, str) else 'unknown'
     if kind == 'custom_emoji':
-        return _rich_text(value.get('alternative_text'))
-    if kind == 'mathematical_expression':
-        return _rich_text(value.get('expression'))
-    if kind == 'button':
-        return _rich_text(value.get('button'))
-    text = _rich_text(value.get('text'))
+        visible = value.get('alternative_text')
+    elif kind == 'mathematical_expression':
+        visible = value.get('expression')
+    elif kind == 'button':
+        button = value.get('button')
+        visible = button.get('text') if isinstance(button, dict) else None
+    else:
+        visible = value.get('text')
+    if visible is None:
+        unsupported.append(_unsupported([f'rich_text.{kind}']))
+        return ''
+    text = _rich_text(visible, unsupported)
     url = value.get('url')
     if kind == 'url' and url is not None:
         url = _text(url)
@@ -117,30 +132,35 @@ def _rich_message(value):
     # expose TelegramObjects. to_dict recursively normalizes those as well.
     if hasattr(value, 'to_dict'):
         value = value.to_dict()
-    nodes = 0
-    def validate(value, depth=0):
-        nonlocal nodes
-        nodes += 1
-        if depth > _RICH_DEPTH or nodes > _RICH_NODES:
+    # Iterator frames bound auxiliary memory by depth, independently of width.
+    stack = [(iter((value,)), 0)]
+    while stack:
+        values, depth = stack[-1]
+        try:
+            child = next(values)
+        except StopIteration:
+            stack.pop()
+            continue
+        if depth > _RICH_DEPTH:
             raise ValueError('Rich message traversal limit')
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if not isinstance(key, str):
-                    raise ValueError('Invalid field name')
-                validate(child, depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for child in value:
-                validate(child, depth + 1)
-        elif isinstance(value, str):
-            _text(value)
-        elif value is not None and not isinstance(value, (int, float, bool)):
+        if isinstance(child, dict):
+            if any(not isinstance(key, str) for key in child):
+                raise ValueError('Invalid field name')
+            stack.append((iter(child.values()), depth + 1))
+        elif isinstance(child, (list, tuple)):
+            stack.append((iter(child), depth + 1))
+        elif isinstance(child, str):
+            _text(child)
+        elif child is not None and not isinstance(child, (int, float, bool)):
             raise ValueError('Invalid value')
-    validate(value)
     if not isinstance(value, dict):
         raise ValueError('Invalid rich message')
     attachments, count = [], 0
     kinds = dict(photo='photo', document='document', voice_note='voice', audio='voice',
                  video='unsupported', animation='unsupported')
+
+    def text(value):
+        return _rich_text(value, attachments)
 
     def blocks(values):
         return '\n'.join(text for value in _sequence(values) if (text := block(value)))
@@ -151,12 +171,19 @@ def _rich_message(value):
         if count > _RICH_BLOCKS:
             raise ValueError('Too many rich blocks')
         if not isinstance(value, dict):
+            attachments.append(_unsupported(['rich_block.unknown']))
             return ''
         kind = value.get('type')
         kind = kind if isinstance(kind, str) else ''
-        parts = [_rich_text(value.get('summary')), _rich_text(value.get('text'))]
+        if kind not in _RICH_TEXT_BLOCKS and kind not in _RICH_MEDIA_BLOCKS:
+            attachments.append(_unsupported([f'rich_block.{kind or "unknown"}']))
+            caption = value.get('caption')
+            return '\n'.join(part for part in (text(value.get('text')), text(caption),
+                text(caption.get('credit')) if isinstance(caption, dict) else '', text(value.get('credit'))) if part)
+        before = len(attachments)
+        parts = [text(value.get('summary')), text(value.get('text'))]
         if kind == 'mathematical_expression':
-            parts.append(_rich_text(value.get('expression')))
+            parts.append(text(value.get('expression')))
         if kind in kinds:
             try:
                 media = value.get(kind)
@@ -180,20 +207,20 @@ def _rich_message(value):
         if kind == 'list':
             for item in _sequence(value.get('items')):
                 if isinstance(item, dict):
-                    parts.append((_rich_text(item.get('label')) + ' ' + blocks(item.get('blocks'))).rstrip())
+                    parts.append((text(item.get('label')) + ' ' + blocks(item.get('blocks'))).rstrip())
         elif kind == 'table':
             for row in _sequence(value.get('cells')):
-                parts.append(' | '.join(_rich_text(cell.get('text')) if isinstance(cell, dict) else ''
+                parts.append(' | '.join(text(cell.get('text')) if isinstance(cell, dict) else ''
                                         for cell in _sequence(row)))
-        elif kind == 'buttons':
-            parts.append(' '.join(_rich_text(button) for button in _sequence(value.get('buttons'))))
         if 'blocks' in value or kind in {'blockquote', 'collage', 'slideshow', 'details'}:
             parts.append(blocks(value.get('blocks')))
+        if kind in {'collage', 'slideshow'} and len(attachments) == before:
+            attachments.append(_unsupported([f'rich_block.{kind}']))
         caption = value.get('caption')
-        parts.append(_rich_text(caption))
+        parts.append(text(caption))
         if isinstance(caption, dict):
-            parts.append(_rich_text(caption.get('credit')))
-        parts.append(_rich_text(value.get('credit')))
+            parts.append(text(caption.get('credit')))
+        parts.append(text(value.get('credit')))
         return '\n'.join(part for part in parts if part)
 
     return blocks(value.get('blocks')), attachments
@@ -404,7 +431,7 @@ class TelegramChannel:
                         if rich is not None:
                             text, items = _rich_message(rich)
                             if any(item.get('content_fields') for item in items):
-                                _warn_update(update, message, 'Unparseable media in')
+                                _warn_update(update, message, 'Unsupported rich content in')
                         else:
                             items = self._media(message)
                             text = _text(getattr(message, 'caption', None) if items else message.text)

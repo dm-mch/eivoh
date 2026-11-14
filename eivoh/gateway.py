@@ -177,14 +177,23 @@ class Gateway:
                     if busy:
                         self._react(row, '✍', turn['task_id'])
                 elif busy and row['id'] not in reserved:
-                    active = self.active_runs.get(turn['task_id'])
-                    task = self.storage.task(row['conversation_id'], turn['task_id'])
-                    if active and row['preparation'] != 'pending' and any(active[0][key] != task[key] for key in ('executor', 'model', 'effort')):
-                        self._notice(row, f"Queued for task {turn['task_id']} after earlier messages, using the selected model and effort.", turn['task_id'], 'admission')
-                    else:
+                    if not self._settings_queue_notice(row, turn['task_id']):
                         self._react(row, '✍', turn['task_id'])
             for reply in self.replies:
                 reply.changed.set()  # A second task or switch may change labels.
+        return True
+
+    def _settings_queue_notice(self, row, task_id):
+        active = self.active_runs.get(task_id)
+        if self.closing or row['preparation'] != 'ready' or not active:
+            return False
+        parent = self.storage.turn_for(active[0]['inbound_id'])
+        child = self.storage.turn_for(row['id'])
+        task = self.storage.task(row['conversation_id'], task_id)
+        if (parent['status'] != 'running' or child['id'] == parent['id'] or child['status'] != 'queued' or
+                not any(active[0][key] != task[key] for key in ('executor', 'model', 'effort'))):
+            return False
+        self._notice(row, f"Queued for task {task_id} after earlier messages, using the selected model and effort.", task_id, 'admission')
         return True
 
     def _prepare_media(self, row):
@@ -197,6 +206,7 @@ class Gateway:
                     async with asyncio.timeout(180):
                         text, items = await self.channels[row['channel']].prepare(row)
                 if self.storage.prepared(row['id'], text, items):
+                    self._settings_queue_notice(self.storage.inbound(row['id']), task_id)
                     if text.startswith('[Voice message, speech-to-text]\n'):
                         transcript = text.split('\n', 1)[1]
                         self._notice(row, '🎤 ' + transcript[:4000], task_id, 'voice')
