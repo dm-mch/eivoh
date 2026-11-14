@@ -64,11 +64,13 @@ class ProcessTree:
         """Track descendants until the CLI exits, then clean the whole tree.
 
         Orphans are adopted by the per-turn subreaper, so a slower scan does not
-        lose them; process exit still ends the watch at once.
+        lose them; a normal exit still ends the watch at once. wait() also waits
+        for the pipes to close, so the loop checks returncode: a descendant
+        holding stdout must not keep the watch from cleaning it up.
         """
         exited = asyncio.ensure_future(self.process.wait())
         try:
-            while not exited.done():
+            while self.process.returncode is None:
                 self.snapshot()
                 await asyncio.wait((exited,), timeout=interval)
         finally:
