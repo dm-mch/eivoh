@@ -225,7 +225,7 @@ async def test_commands_registered_once_and_failure_does_not_stop_poll(registrat
     with pytest.raises(asyncio.CancelledError):
         await channel.poll(AsyncMock())
     bot.set_my_commands.assert_awaited_once()
-    assert [name for name, _ in bot.set_my_commands.call_args.args[0]] == ['new', 'tasks', 'model', 'effort', 'stop', 'q', 'close', 'title']
+    assert [name for name, _ in bot.set_my_commands.call_args.args[0]] == ['new', 'tasks', 'model', 'effort', 'stop', 'q', 'close', 'title', 'usage']
     assert bot.get_updates.await_count == 2
     if registration_error:
         assert 'command registration failed' in caplog.text

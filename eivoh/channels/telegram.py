@@ -352,6 +352,7 @@ class TelegramChannel:
                 ("q", "Queue a message after the running turn"),
                 ("close", "Close a task"),
                 ("title", "Rename a task"),
+                ("usage", "Subscription limits left"),
             ])
         except Exception as exc:
             log.warning("Telegram command registration failed: %s", type(exc).__name__)

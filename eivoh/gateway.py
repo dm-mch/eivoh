@@ -4,6 +4,7 @@ from contextlib import aclosing, suppress
 from datetime import datetime, timezone
 import logging
 import json
+import time
 
 from .channels.base import Channel, Inbound
 from .executors.base import Executor
@@ -11,6 +12,7 @@ from .models import catalog, resolve, effort_levels
 from .storage import Storage, command
 from . import titles
 from .attachments import AttachmentError, output_instructions, snapshot_outputs, visible_text
+from .usage import format_usage
 
 log = logging.getLogger(__name__)
 RESTART_PROMPT = "The service restarted; continue the interrupted task. Check existing work before repeating actions."
@@ -89,7 +91,8 @@ class Reply:
 class Gateway:
     def __init__(self, storage: Storage, executor: Executor, channels: dict[str, Channel],
                  edit_interval=1.5, typing_interval=4, max_recoveries=3, executors=None, max_parallel=3,
-                 title_executors=None, title_timeout=30, delivery_retry_delays=(1, 2, 4, 8, 16), delivery_timeout=300):
+                 title_executors=None, title_timeout=30, delivery_retry_delays=(1, 2, 4, 8, 16), delivery_timeout=300,
+                 usage=None):
         # `executor` is the default one; `executors` adds named alternatives.
         self.default_executor = storage.default_executor
         self.executors = {**(executors or {}), self.default_executor: executor}
@@ -106,6 +109,8 @@ class Gateway:
         self.title_executors = title_executors or {}
         self.title_timeout = title_timeout
         self.delivery_retry_delays, self.delivery_timeout = delivery_retry_delays, delivery_timeout
+        self.usage = usage  # Subscription limits (eivoh.usage.UsageService); optional.
+        self.usage_jobs = set()
         self.title_jobs = {}
         self.replies = set()
         self.workers = {}
@@ -556,11 +561,33 @@ class Gateway:
                 await handler(row, task, arg, new_task=new_task)
             elif cmd == '/q':
                 raise ValueError('Use /q <text> to queue a message after the running turn.')
+            elif cmd == '/usage':
+                if self.usage is None:
+                    raise ValueError('Usage is not configured.')
+                self.storage.finish_command(row['id'])
+                self._report_usage(row)
             else:
-                raise ValueError('Unknown command. Use /tasks, /new, /task, /model, /effort, /stop, /close or /title.')
+                raise ValueError('Unknown command. Use /tasks, /new, /task, /model, /effort, /stop, /close, /title or /usage.')
         except ValueError as exc:
             self.storage.finish_command(row['id'])
             await self._send(row, str(exc), task['id'] if task else None)
+
+    def _report_usage(self, row):
+        # Probes take seconds and commands run under the chat lock: answer from a
+        # background job. A crash before the answer loses it; there is no replay.
+        if self.closing:
+            return
+        async def report():
+            try:
+                text = format_usage(await self.usage.snapshot(), time.time())
+            except Exception as exc:
+                log.exception('Usage check failed')
+                text = f'Usage check failed: {exc}'
+            if not self.closing:
+                await self._send(row, text)
+        job = asyncio.create_task(report())
+        self.usage_jobs.add(job)
+        job.add_done_callback(self.usage_jobs.discard)
 
     async def _tasks(self, row, arg):
         parts = arg.split()
@@ -814,6 +841,11 @@ class Gateway:
                 async with aclosing(stream):
                     async for record in stream:
                         self.storage.append(turn["id"], record, allow_result=not self.closing)
+                        if self.usage is not None:
+                            try:
+                                self.usage.observe(record.payload)
+                            except Exception:
+                                log.exception('Usage observation failed')
                         for event in record.events:
                             data = event.data
                             if event.kind == "text_delta":
@@ -955,7 +987,7 @@ class Gateway:
     async def shutdown(self):
         self.begin_shutdown()
         jobs = [*self.workers.values(), *self.title_jobs.values(),
-                *self.media_jobs.values(), *self.output_jobs.values(),
+                *self.media_jobs.values(), *self.output_jobs.values(), *self.usage_jobs,
                 *(job for jobs in self.steer_jobs.values() for job in jobs),
                 *(job for jobs in self.notice_jobs.values() for job in jobs)]
         for job in jobs:
