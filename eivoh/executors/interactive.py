@@ -153,14 +153,8 @@ class InteractiveExecutor(CliExecutor):
                 await queue.put(Record(None, None, (Event('error', {'message': str(exc) or 'Executor initialization timed out'}, None),)))
                 await tree.cleanup(self.grace)
 
-        async def watch():
-            while proc.returncode is None:
-                tree.snapshot()
-                await asyncio.sleep(0.025)
-            await tree.cleanup(0)
-
         jobs = [asyncio.create_task(read(proc.stdout, 'stdout')), asyncio.create_task(read(proc.stderr, 'stderr')),
-                asyncio.create_task(watch()), asyncio.create_task(initialize())]
+                asyncio.create_task(tree.watch()), asyncio.create_task(initialize())]
         completed, eof = False, 0
         try:
             while eof < 2:

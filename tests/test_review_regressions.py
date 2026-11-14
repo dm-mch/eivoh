@@ -101,8 +101,18 @@ async def test_shutdown_before_executor_exit_stays_recoverable(rig, ending):
                        for event in json.loads(record['events']))
 
 
-async def test_final_delivery_honours_backoff_over_ten_seconds():
+async def test_final_delivery_honours_backoff_over_ten_seconds(monkeypatch):
     from eivoh.gateway import Reply
+    # Record the long back-off instead of waiting it out; short sleeps stay real.
+    real_sleep, long_waits = asyncio.sleep, []
+
+    async def sleep(delay, *args, **kwargs):
+        if delay >= 10:
+            long_waits.append(delay)
+            delay = 0
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, 'sleep', sleep)
     bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
         RetryAfter(10.1), SimpleNamespace(message_id=5)]))
     channel = TelegramChannel('unused', 1, bot)
@@ -112,6 +122,7 @@ async def test_final_delivery_honours_backoff_over_ten_seconds():
         await reply.finish()
         assert bot.send_message.call_count == 2
         assert reply.sent == 'final answer'
+        assert len(long_waits) == 1 and long_waits[0] >= 10.1
     finally:
         await reply.cancel()
 

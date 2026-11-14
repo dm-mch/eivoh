@@ -13,15 +13,28 @@ import sys
 from .base import Event, Record, SteerResult
 
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+WATCH_INTERVAL = 0.2  # Seconds between descendant scans of a running turn.
 
 
 def process_table() -> dict[int, tuple[int, str, str]]:
-    """pid -> (ppid, start ticks, state); only /proc stat, never process secrets."""
+    """pid -> (ppid, start ticks, state); only /proc stat, never process secrets.
+
+    Runs on the event loop every few tens of milliseconds while a turn is
+    running, so it reads with raw file descriptors: pathlib glob and text I/O
+    made one scan several times slower.
+    """
     table = {}
-    for path in Path("/proc").glob("[0-9]*/stat"):
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
         try:
-            fields = path.read_text().rsplit(")", 1)[1].split()
-            table[int(path.parent.name)] = (int(fields[1]), fields[19], fields[0])
+            fd = os.open(f"/proc/{entry.name}/stat", os.O_RDONLY)
+            try:
+                data = os.read(fd, 4096)
+            finally:
+                os.close(fd)
+            fields = data[data.rindex(b")") + 1:].split()
+            table[int(entry.name)] = (int(fields[1]), fields[19].decode(), fields[0].decode())
         except (OSError, ValueError, IndexError):
             continue
     return table
@@ -46,6 +59,21 @@ class ProcessTree:
                     roots.add(pid)
                     changed = True
         return table
+
+    async def watch(self, interval: float = WATCH_INTERVAL):
+        """Track descendants until the CLI exits, then clean the whole tree.
+
+        Orphans are adopted by the per-turn subreaper, so a slower scan does not
+        lose them; process exit still ends the watch at once.
+        """
+        exited = asyncio.ensure_future(self.process.wait())
+        try:
+            while not exited.done():
+                self.snapshot()
+                await asyncio.wait((exited,), timeout=interval)
+        finally:
+            exited.cancel()
+        await self.cleanup(0)  # Includes tool children holding stdout open.
 
     def signal(self, pid, sig, table):
         if pid in table and table[pid][1] == self.known.get(pid) and table[pid][2] != "Z":
@@ -180,12 +208,6 @@ class CliExecutor:
             finally:
                 await queue.put(None)
 
-        async def watch():
-            while proc.returncode is None:
-                tree.snapshot()
-                await asyncio.sleep(0.025)
-            await tree.cleanup(0)  # Includes tool children holding stdout open.
-
         async def write():
             try:
                 proc.stdin.write(prompt.encode())
@@ -197,7 +219,7 @@ class CliExecutor:
 
         jobs = [asyncio.create_task(read(proc.stdout, "stdout")),
                 asyncio.create_task(read(proc.stderr, "stderr")),
-                asyncio.create_task(watch()), asyncio.create_task(write())]
+                asyncio.create_task(tree.watch()), asyncio.create_task(write())]
         completed = False
         try:
             eof = 0
