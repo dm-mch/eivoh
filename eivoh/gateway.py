@@ -805,8 +805,10 @@ class Gateway:
             executor = self.executors.get(turn["executor"])
             if executor is None:
                 raise RuntimeError(f"Executor {turn['executor']} is not configured")
-            stream = (executor.resume(turn["id"], turn["resume_id"], prompt, model=turn["model"], effort=turn["effort"])
-                      if turn["resume_id"] else executor.start(turn["id"], prompt, model=turn["model"], effort=turn["effort"]))
+            # A task without a recorded folder keeps the executor's default directory.
+            options = dict(model=turn["model"], effort=turn["effort"], **({'cwd': turn['workdir']} if turn.get('workdir') else {}))
+            stream = (executor.resume(turn["id"], turn["resume_id"], prompt, **options)
+                      if turn["resume_id"] else executor.start(turn["id"], prompt, **options))
             async def consume():
                 nonlocal text, tool, error, completed, current_deltas
                 async with aclosing(stream):

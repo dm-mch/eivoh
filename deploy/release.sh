@@ -27,6 +27,13 @@ uv pip compile pyproject.toml --extra dev --output-file .venv/release-requiremen
 uv pip sync --python .venv/bin/python .venv/release-requirements.txt
 uv pip install --python .venv/bin/python --no-deps .
 EIVOH_LIVE=0 .venv/bin/python -m pytest -q -m 'not live'
+# After validation, so a rejected release never touches the home. A revision
+# before V3.1 (rollback) has no templates and no seeding module.
+if [[ -d "$release_dir/templates/home" ]]; then
+    # Seed missing home files and report template changes; never overwrites the home.
+    .venv/bin/python -m eivoh.home seed --home "${EIVOH_HOME:-$HOME/eivoh-home}" --templates "$release_dir/templates/home" \
+        --core "$source_dir" --commit "$revision"
+fi
 echo "Validated release: $revision"
 if [[ ${2:-} == --restart ]]; then
     systemctl --user restart eivoh.service

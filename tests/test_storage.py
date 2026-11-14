@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from eivoh.executors.claude import parse_line
-from eivoh.storage import Storage
+from eivoh.storage import LegacyWorkdirRequired, Storage
 from conftest import inbound
 
 
@@ -81,7 +81,7 @@ def test_task_owns_session_across_turns_and_new(tmp_path):
 def test_schema_version_reopen_and_future_rejected(tmp_path):
     path = tmp_path / 'version.db'
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 9
     store.journal(inbound(1, 'retained'))
     store.close()
     store = Storage(path)
@@ -134,7 +134,7 @@ def test_v6_migration_adds_message_indexes_without_changing_journal(tmp_path, mo
         before = {table: [tuple(row) for row in store.db.execute(f'SELECT * FROM {table} ORDER BY rowid')] for table in tables}
         store.close()
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 9
     for table in tables:
         assert [tuple(row) for row in store.db.execute(f'SELECT {columns[table]} FROM {table} ORDER BY rowid')] == before[table]
     for table in ('inbound', 'delivery'):
@@ -143,7 +143,7 @@ def test_v6_migration_adds_message_indexes_without_changing_journal(tmp_path, mo
     assert not store.db.execute('PRAGMA foreign_key_check').fetchall()
     store.close()
     store = Storage(path)
-    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 9
     store.close()
 
 
@@ -196,7 +196,7 @@ def test_v1_upgrades_in_place(tmp_path):
                    "VALUES (1,1,1,1,'running','old-session')")
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 9
         task = store.active_task(1)
         assert task['model'] is None and task['session_id'] == 'old-session'
         turn, recovering = store.claim(1, 3)
@@ -316,3 +316,57 @@ def test_transcript_notice_does_not_evict_only_recent_turn(tmp_path):
         assert '[Text truncated]' in text and 'question 1' not in text
     finally:
         store.close()
+
+
+def test_task_workdir_migration_backfill_and_fixed_at_creation(tmp_path, monkeypatch):
+    import eivoh.storage as module
+    path, legacy, home, other = tmp_path / 'v8.db', tmp_path / 'core', tmp_path / 'home', tmp_path / 'other'
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'MIGRATIONS', module.MIGRATIONS[:8])
+        store = Storage(path)
+        with store.db:  # Running at the upgrade: recovered after it.
+            store.db.execute("INSERT INTO conversation(id,channel,chat_id) VALUES (1,'fake','10')")
+            store.db.execute("INSERT INTO task(id,conversation_id,executor) VALUES (1,1,'claude')")
+            store.db.execute("UPDATE conversation SET active_task_id=1 WHERE id=1")
+            store.db.execute("INSERT INTO inbound(id,conversation_id,channel,chat_id,user_id,message_id,text,state) "
+                             "VALUES (1,1,'fake','10','1','1','before','running')")
+            store.db.execute("INSERT INTO turn(id,inbound_id,conversation_id,task_id,status,executor) VALUES (1,1,1,1,'running','claude')")
+        old = store.inbound(1)
+        store.close()
+    # Without the legacy folder the start fails and leaves the database as it was.
+    with pytest.raises(LegacyWorkdirRequired, match=r'EIVOH_WORKDIR must be set: 1 task\(s\)'):
+        Storage(path, task_workdir=home)
+    with sqlite3.connect(path) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert 'workdir' not in {row[1] for row in db.execute('PRAGMA table_info(task)')}
+    store = Storage(path, task_workdir=home, legacy_workdir=legacy)
+    assert store.db.execute('PRAGMA user_version').fetchone()[0] == 9
+    assert store.inbound(old['id'])['text'] == 'before'
+    assert [row[0] for row in store.db.execute('SELECT workdir FROM task')] == [str(legacy)]
+    turn, recovering = store.claim(old['id'], 3)
+    assert recovering and turn['workdir'] == str(legacy)
+    store.new_task(store.journal(inbound(2, '/new'))['id'])
+    fresh = store.journal(inbound(3, 'after'))
+    turn, recovering = store.claim(fresh['id'], 3)
+    assert not recovering and turn['workdir'] == str(home)
+    store.close()
+    # Idempotent; a later home never moves an existing task.
+    store = Storage(path, task_workdir=other, legacy_workdir=other)
+    assert [row[0] for row in store.db.execute('SELECT workdir FROM task ORDER BY id')] == [str(legacy), str(home)]
+    assert store.claim(fresh['id'], 3)[0]['workdir'] == str(home)
+    store.close()
+
+
+def test_fresh_database_needs_no_legacy_workdir(tmp_path):
+    store = Storage(tmp_path / 'fresh.db', task_workdir=tmp_path)
+    turn, _ = store.claim(store.journal(inbound(1, 'work'))['id'], 3)
+    assert turn['workdir'] == str(tmp_path)
+    store.close()
+    Storage(tmp_path / 'fresh.db', task_workdir=tmp_path).close()
+
+
+def test_task_workdir_unset_without_parameters(tmp_path):
+    store = Storage(tmp_path / 'plain.db')
+    turn, _ = store.claim(store.journal(inbound(1, 'work'))['id'], 3)
+    assert turn['workdir'] is None
+    store.close()
