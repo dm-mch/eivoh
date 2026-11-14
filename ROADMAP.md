@@ -1,6 +1,6 @@
 # Eivoh development plan
 
-Current stage: V3. V0, V1 and V2 are done (2026-11-13). No dates are set. The architecture describes the target system; this file describes the order in which it appears and is the only place where the current stage is stated.
+Current stage: V3, part V3.2. V0, V1 and V2 are done (2026-11-13); V3.1 is done (2026-11-14). No dates are set. The architecture describes the target system; this file describes the order in which it appears and is the only place where the current stage is stated.
 
 # How the plan works
 
