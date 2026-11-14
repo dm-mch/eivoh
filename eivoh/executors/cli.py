@@ -40,6 +40,13 @@ def process_table() -> dict[int, tuple[int, str, str]]:
     return table
 
 
+def missing_directory(cwd):
+    """Fail the turn visibly; never fall back to another working folder."""
+    if not Path(cwd).is_dir():
+        return Record(None, None, (Event("error", {"message": f"Working folder {cwd} of this task does not exist"}, None),))
+    return None
+
+
 @dataclass
 class ProcessTree:
     process: asyncio.subprocess.Process
@@ -144,23 +151,27 @@ class CliExecutor:
                 "configured_model": None, "configured_model_source": None,
                 "observed_model": None}
 
-    def start(self, run_id, prompt, model=None, effort=None):
-        return self._turn(run_id, prompt, model=model, effort=effort)
+    def start(self, run_id, prompt, model=None, effort=None, cwd=None):
+        return self._turn(run_id, prompt, model=model, effort=effort, cwd=cwd)
 
-    def resume(self, run_id, session_id, prompt, model=None, effort=None):
+    def resume(self, run_id, session_id, prompt, model=None, effort=None, cwd=None):
         if not SESSION_ID.fullmatch(session_id):
             raise ValueError("Invalid executor session id")
-        return self._turn(run_id, prompt, session_id, model, effort)
+        return self._turn(run_id, prompt, session_id, model, effort, cwd)
 
-    async def _turn(self, run_id, prompt, session_id=None, model=None, effort=None):
+    async def _turn(self, run_id, prompt, session_id=None, model=None, effort=None, cwd=None):
         if run_id in self.running or run_id in self.starting:
             raise RuntimeError("Run already running")
+        cwd = self.workdir if cwd is None else Path(cwd)
+        if error := missing_directory(cwd):
+            yield error
+            return
         args = self.command(session_id, model, effort)
         env = self.environment()
         parse_line = self.parser()
         async def spawn():
             supervisor = Path(__file__).with_name("supervisor.py")
-            proc = await asyncio.create_subprocess_exec(sys.executable, str(supervisor), str(self.grace), *args, cwd=self.workdir, env=env,
+            proc = await asyncio.create_subprocess_exec(sys.executable, str(supervisor), str(self.grace), *args, cwd=cwd, env=env,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, start_new_session=True, limit=8 * 1024 * 1024)
             tree = ProcessTree(proc)
@@ -187,7 +198,7 @@ class CliExecutor:
         # Journal launch settings; observed model IDs belong to executor events.
         # The prompt goes to stdin, so argv holds no message content.
         await queue.put(Record(None, {"executor": type(self).__name__, **self.model_metadata(model, effort),
-                                      "argv": args, "cwd": str(self.workdir)}, stream="meta"))
+                                      "argv": args, "cwd": str(cwd)}, stream="meta"))
 
         async def read(pipe, stream):
             def record(line):

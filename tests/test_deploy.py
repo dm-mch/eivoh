@@ -10,11 +10,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('existing,restart,fail', [
-    (False, False, False), (False, True, False), (True, False, False),
-    (True, True, True),
+@pytest.mark.parametrize('existing,restart,fail,seed_fail', [
+    (False, False, False, False), (False, True, False, False), (True, False, False, False),
+    (True, True, True, False), (True, True, True, True),
 ])
-def test_release_worktree_validation_and_explicit_restart(tmp_path, existing, restart, fail):
+def test_release_worktree_validation_and_explicit_restart(tmp_path, existing, restart, fail, seed_fail):
     release = tmp_path / 'run'
     source = tmp_path / 'source'
     source.mkdir()
@@ -39,6 +39,8 @@ if name == 'git':
         print('candidate-commit')
     elif 'HEAD' in args:
         print('previous-commit')
+elif name == 'python' and args[:2] == ['-m', 'eivoh.home']:
+    sys.exit(int(os.environ['TEST_RELEASE_SEED_FAIL']))
 elif name == 'python':
     assert os.environ['EIVOH_LIVE'] == '0'
     sys.exit(int(os.environ['TEST_RELEASE_FAIL']))
@@ -71,13 +73,21 @@ if 'venv' in args:
     env = dict(os.environ, PATH=f'{binaries}:/usr/bin:/bin',
                TEST_RELEASE_LOG=str(log), TEST_RELEASE_SOURCE=str(source),
                TEST_RELEASE_DEST=str(release), TEST_RELEASE_PYTHON_STUB=str(python_stub),
-               TEST_RELEASE_FAIL=str(int(fail)))
+               TEST_RELEASE_FAIL=str(int(fail)), TEST_RELEASE_SEED_FAIL=str(int(seed_fail)),
+               EIVOH_HOME=str(tmp_path / 'home'))  # Never the real ~/eivoh-home.
     result = subprocess.run(['bash', str(script), 'requested-commit'] + (['--restart'] if restart else []),
                             env=env, capture_output=True, text=True)
     assert result.returncode == int(fail), result.stderr
     commands = [json.loads(line) for line in log.read_text().splitlines()]
     assert any(row[0:3] == ['uv', 'pip', 'sync'] for row in commands)
-    assert ['python', '-m', 'pytest', '-q', '-m', 'not live'] in commands
+    seed = ['python', '-m', 'eivoh.home', 'seed', '--home', str(tmp_path / 'home'), '--templates',
+            f'{release}/templates/home', '--core', str(source), '--commit', 'candidate-commit']
+    assert seed in commands
+    pytest_run = ['python', '-m', 'pytest', '-q', '-m', 'not live']
+    if seed_fail:
+        assert pytest_run not in commands  # A failed seeding fails the release.
+    else:
+        assert commands.index(seed) < commands.index(pytest_run)
     assert any(row[0] == 'systemctl' for row in commands) == (restart and not fail)
     if existing:
         assert 'Previous commit (rollback): previous-commit' in result.stdout

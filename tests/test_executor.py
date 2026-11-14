@@ -72,6 +72,7 @@ async def test_config_args_reach_fake_executor_on_start_and_resume(rig, monkeypa
     monkeypatch.setenv('EIVOH_TELEGRAM_TOKEN', 'test-only')
     monkeypatch.setenv('EIVOH_OWNER_ID', '123')
     monkeypatch.setenv('EIVOH_WORKDIR', str(path))
+    monkeypatch.setenv('EIVOH_HOME', str(path))
     monkeypatch.setenv('EIVOH_CLAUDE_ARGS', f"--settings '{settings}'")
     config = Config.from_env()
     adapter = ClaudeExecutor(config.workdir, executor.binary, model='test-model',

@@ -25,11 +25,13 @@ async def serve(config: Config):
 
 async def _serve_locked(config: Config):
     os.umask(0o077)
-    storage = Storage(config.state_dir / "eivoh.sqlite3", config.default_executor)
+    # New tasks work in the home; tasks created before V3.1 keep the old folder.
+    storage = Storage(config.state_dir / "eivoh.sqlite3", config.default_executor,
+                      task_workdir=config.home, legacy_workdir=config.workdir)
     executors = {
-        "claude": ClaudeStreamExecutor(config.workdir, config.claude_bin, config.claude_model,
+        "claude": ClaudeStreamExecutor(config.home, config.claude_bin, config.claude_model,
                                  config.permission_mode, extra_args=config.claude_args),
-        "codex": CodexAppExecutor(config.workdir, config.codex_bin, config.codex_model,
+        "codex": CodexAppExecutor(config.home, config.codex_bin, config.codex_model,
                                extra_args=config.codex_args),
     }
     executor = executors.pop(config.default_executor)

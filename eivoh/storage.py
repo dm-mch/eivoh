@@ -138,12 +138,17 @@ MIGRATIONS = (
         "ALTER TABLE task ADD COLUMN effort TEXT",
         "ALTER TABLE turn ADD COLUMN effort TEXT",
     ),
+    # A task's working folder, fixed at creation: executor sessions are bound to it.
+    ("ALTER TABLE task ADD COLUMN workdir TEXT",),
 )
 
 
 class Storage:
-    def __init__(self, path: Path, default_executor="claude"):
+    def __init__(self, path: Path, default_executor="claude", *, task_workdir=None, legacy_workdir=None):
+        """task_workdir: working folder of tasks created from now on.
+        legacy_workdir: backfilled into tasks that have none (created before V3.1)."""
         self.default_executor = default_executor
+        self.task_workdir = str(Path(task_workdir).resolve()) if task_workdir is not None else None
         self.state_dir = path.parent.resolve()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(path)
@@ -167,6 +172,8 @@ class Storage:
                                                "JOIN inbound ON inbound.id=turn.inbound_id"):
                         self.db.execute("UPDATE task SET title=? WHERE id=?", (default_title(row['text']), row['id']))
                 self.db.execute(f"PRAGMA user_version={index + 1}")
+            if legacy_workdir is not None:
+                self.db.execute("UPDATE task SET workdir=? WHERE workdir IS NULL", (str(Path(legacy_workdir).resolve()),))
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -329,6 +336,7 @@ class Storage:
         claimed = dict(self.turn_for(inbound_id))
         session = self.session(claimed['task_id'], claimed['executor'])
         claimed['resume_id'] = session['session_id'] if session else None
+        claimed['workdir'] = self.db.execute("SELECT workdir FROM task WHERE id=?", (claimed['task_id'],)).fetchone()[0]
         return claimed, recovering
 
     def append(self, turn_id: int, record: Record, *, allow_result=True):
@@ -412,9 +420,9 @@ class Storage:
                             ("cancelled" if status == "cancelled" else "done", turn_id))
 
     def _create_task(self, conversation_id, executor=None, model=None, title=None, effort=None):
-        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model,title,last_active,title_source,effort) VALUES (?,?,?,?,?,?,?)",
+        task_id = self.db.execute("INSERT INTO task(conversation_id,executor,model,title,last_active,title_source,effort,workdir) VALUES (?,?,?,?,?,?,?,?)",
                                   (conversation_id, executor or self.default_executor, model, title, now(),
-                                   'manual' if title is not None else 'fallback', effort)).lastrowid
+                                   'manual' if title is not None else 'fallback', effort, self.task_workdir)).lastrowid
         self.db.execute("UPDATE conversation SET active_task_id=? WHERE id=?", (task_id, conversation_id))
         return task_id
 

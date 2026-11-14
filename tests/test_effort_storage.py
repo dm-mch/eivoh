@@ -33,7 +33,7 @@ def test_v7_migration_preserves_all_existing_columns(tmp_path, monkeypatch):
         store.close()
     store = Storage(path)
     try:
-        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert store.db.execute('PRAGMA user_version').fetchone()[0] == 9
         for table in tables:
             assert [tuple(row) for row in store.db.execute(f'SELECT {columns[table]} FROM {table} ORDER BY rowid')] == before[table]
         assert store.task(1, 1)['effort'] is None

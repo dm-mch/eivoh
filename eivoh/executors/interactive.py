@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 from .base import Event, Record, SteerResult
-from .cli import CliExecutor, ProcessTree, process_table
+from .cli import CliExecutor, ProcessTree, missing_directory, process_table
 
 
 @dataclass
@@ -14,6 +14,7 @@ class Run:
     run_id: int
     proc: asyncio.subprocess.Process
     session_id: str | None = None
+    cwd: Path | None = None
     turn_id: str | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -86,14 +87,18 @@ class InteractiveExecutor(CliExecutor):
         except (BrokenPipeError, ConnectionResetError):
             return SteerResult('unknown' if written else 'not_sent', 'Transport closed')
 
-    async def _turn(self, run_id, prompt, session_id=None, model=None, effort=None):
+    async def _turn(self, run_id, prompt, session_id=None, model=None, effort=None, cwd=None):
         if run_id in self.running or run_id in self.starting:
             raise RuntimeError('Run already running')
+        cwd = self.workdir if cwd is None else Path(cwd)
+        if error := missing_directory(cwd):
+            yield error
+            return
         args = self.command(session_id, model, effort)
         async def spawn():
             supervisor = Path(__file__).with_name('supervisor.py')
             proc = await asyncio.create_subprocess_exec(sys.executable, str(supervisor), str(self.grace), *args,
-                cwd=self.workdir, env=self.environment(), stdin=asyncio.subprocess.PIPE,
+                cwd=cwd, env=self.environment(), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
                 limit=8 * 1024 * 1024)
             tree = ProcessTree(proc)
@@ -114,11 +119,11 @@ class InteractiveExecutor(CliExecutor):
         finally:
             self.starting.pop(run_id, None)
         proc = tree.process
-        run = Run(run_id, proc, session_id)
+        run = Run(run_id, proc, session_id, cwd)
         self.runs[run_id] = run
         queue = asyncio.Queue()
         await queue.put(Record(None, {'executor': type(self).__name__, **self.model_metadata(model, effort),
-                                     'argv': args, 'cwd': str(self.workdir)}, stream='meta'))
+                                     'argv': args, 'cwd': str(cwd)}, stream='meta'))
 
         async def read(pipe, stream):
             async def line_record(line):

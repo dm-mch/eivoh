@@ -12,17 +12,18 @@ Bootstrap: the current version of the instructions and the accumulated experienc
 
 * [VISION.md](VISION.md): purpose, long-term direction and guiding principles.
 * [ARCHITECTURE.md](ARCHITECTURE.md): target components, their connections and open technical decisions.
-* [AGENTS.md](AGENTS.md): instructions for the agent working on the project now.
+* [AGENTS.md](AGENTS.md): instructions for work on this repository.
+* [templates/home/](templates/home/AGENTS.md): what the agent's home is seeded from, starting with the agent's own rules.
 * [EVOLUTION.md](EVOLUTION.md): reflection and changes to memory, strategies, skills and code.
 * [EXPERIENCE.md](EXPERIENCE.md): raw records, knowledge, current state and search.
 * [ROADMAP.md](ROADMAP.md): development stages, the current stage and the expected result of each stage.
-* private/: a separate private repository that the core ignores. Each Eivoh instance creates it locally: private/experience/ holds experience records and their index, private/archive/ holds archives, which are neither instructions nor agreed decisions.
+* The agent's home (`EIVOH_HOME`, by default `~/eivoh-home`): a separate private git repository outside the core, seeded from the templates on deployment. It holds the agent's rules, experience records and their index, skills, notes and archives, and it is the working directory of every task.
 
 # Getting started
 
 1. Prepare a working copy of the Markdown files and open it in Codex or Claude. Google Docs are a place for collaborative editing, not the agent's runtime.
-2. Follow AGENTS.md: read the documents it names, check the actual state of the project and set a specific task.
-3. Make the smallest useful change and save the result, the reasons and the limitations. Put the experience record in private/experience/.
+2. Follow the `AGENTS.md` of the home and, for work on this repository, [AGENTS.md](AGENTS.md): read the documents they name, check the actual state of the project and set a specific task.
+3. Make the smallest useful change and save the result, the reasons and the limitations. Put the experience record in the home's `experience/` folder.
 
 # Development direction
 
@@ -30,7 +31,7 @@ The target system runs continuously on a VM, supports interchangeable communicat
 
 # Private and public
 
-The public core contains the shared documents and code. The private/ folder is the private part, kept in a separate repository: experience, correspondence, archives and state. The agent makes core changes on the working branch `work`; they reach `main` through a PR. The rules for changes and publication are in [AGENTS.md](AGENTS.md).
+The public core contains the shared documents, the code and the templates of the home. The agent's home is the private part, kept in a separate repository: the agent's rules, experience, correspondence and archives. The agent makes core changes on the working branch `work`; they reach `main` through a PR. The rules for changes and publication are in [AGENTS.md](AGENTS.md).
 
 # Operating the gateway
 
@@ -54,8 +55,9 @@ user ID. Never commit this file:
 ```ini
 EIVOH_TELEGRAM_TOKEN=replace-with-your-bot-token
 EIVOH_OWNER_ID=123456789
-EIVOH_WORKDIR=/home/your-user/src/eivoh
 # Optional overrides:
+# EIVOH_HOME=/home/your-user/eivoh-home
+# EIVOH_WORKDIR=/home/your-user/src/eivoh
 # EIVOH_STATE_DIR=/home/your-user/.local/state/eivoh
 # EIVOH_CLAUDE_MODEL=haiku
 # EIVOH_CLAUDE_MODELS=fable,opus,sonnet,haiku,claude-fable-5-2,claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5
@@ -70,8 +72,12 @@ EIVOH_WORKDIR=/home/your-user/src/eivoh
 # EIVOH_STT=soniox
 ```
 
-Set `EIVOH_WORKDIR` explicitly to the working tree the executor should edit,
-normally `~/src/eivoh` (use an absolute path in the environment file). Defaults:
+`EIVOH_HOME` is the agent's home and the working directory of every new task; it
+must exist, and `deploy/release.sh` seeds it from `templates/home/`. A task keeps
+the directory it was created in, because an executor session is bound to its
+directory. `EIVOH_WORKDIR` is only the directory of tasks created before the home
+existed; set it when upgrading an installation that used it, otherwise leave it
+unset. Use absolute paths in the environment file. Defaults: home `~/eivoh-home`,
 state in `~/.local/state/eivoh`, no model override, permission mode
 `bypassPermissions`, binary `claude`.
 The default permission mode allows tools without interactive approval; other
@@ -101,7 +107,7 @@ also inherits model and effort if it matches the current task’s executor; a
 different executor uses its defaults. With no current task, the default executor
 is `EIVOH_DEFAULT_EXECUTOR` (default `claude`). Each
 turn runs a local `codex app-server --listen stdio://` subprocess in
-`EIVOH_WORKDIR`. Eivoh starts or resumes its native thread, streams answer deltas,
+the task's working folder. Eivoh starts or resumes its native thread, streams answer deltas,
 and injects clarifications through `turn/steer`. Existing threads created by
 `codex exec` are resumed without resetting them. Each run has its own supervised
 process; no remote server is involved. The Codex sandbox is bypassed like
@@ -355,7 +361,15 @@ unverified.
 
 The service uses a separate detached release worktree at
 `~/.local/share/eivoh/run`, with its own venv. Editing the executor's working tree
-does not edit that release. Release a commit containing the implementation before
+does not edit that release. The release script also seeds the
+agent's home (`EIVOH_HOME`, by default `~/eivoh-home`) from `templates/home/`: it
+adds missing files, never overwrites an existing one, and records in
+`.eivoh-template` the core commit the home was reconciled with. When the templates
+changed since that commit it prints a notice and leaves the home as it is; the
+agent merges the change as a task. Keep the home a private git repository. The script
+takes the home from `EIVOH_HOME` in the shell that runs it, not from the service's
+environment file: export it when the home is not at the default path. The service
+does not start until the home exists, so release before the first restart. Release a commit containing the implementation before
 installing the systemd **user** service (no sudo):
 
 ```sh
@@ -417,8 +431,8 @@ executor-slot accounting.
 Cancellation is committed before terminating the target task's process tree.
 Cancelled messages remain in the journal.
 
-Known limitation: parallel tasks share one working tree (`EIVOH_WORKDIR`) and can
-edit the same files. Task isolation, such as a worktree per task, is not built.
+Known limitation: parallel tasks share one working directory, the home, and can
+edit the same project files. Task isolation, such as a worktree per task, is not built.
 
 SQLite (`eivoh.sqlite3` in the state directory) uses WAL and synchronous FULL for
 durable inbound commits before processing and polling acknowledgment. Schema
